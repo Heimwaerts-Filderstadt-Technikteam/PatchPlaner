@@ -42,6 +42,10 @@ Läuft ohne Docker und ohne npm-Pakete: nur Node.js 22.13 oder neuer (SQLite ist
 - Eigene Kabelfarben, Hell/Dunkel/System
 - Admin-Bereich: Benutzer, Registrierung an/aus, Passwort zurücksetzen, Test-E-Mail
 
+## Proxmox
+
+Am sparsamsten läuft PatchPlaner in einem kleinen LXC-Container (1 Kern, 384 MB RAM, 3 GB Disk). Ein Skript legt ihn mit einem Befehl an: siehe [docs/PROXMOX.md](docs/PROXMOX.md).
+
 ## Installation ohne Docker (Debian/Ubuntu)
 
 ```bash
