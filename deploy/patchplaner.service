@@ -1,0 +1,22 @@
+[Unit]
+Description=PatchPlaner – AV-Planung
+After=network.target
+
+[Service]
+Type=simple
+User=patchplaner
+Group=patchplaner
+WorkingDirectory=/opt/patchplaner
+ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning /opt/patchplaner/server.js
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+# Härtung
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/patchplaner/data
+
+[Install]
+WantedBy=multi-user.target

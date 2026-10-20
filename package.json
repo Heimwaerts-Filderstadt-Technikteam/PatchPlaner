@@ -1,0 +1,13 @@
+{
+  "name": "patchplaner",
+  "version": "1.0.0",
+  "description": "Selbst gehostetes AV-Planungstool: Diagramme, Grundrisse, Kabellängen, Pack- und Patchlisten, Teams",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server.js"
+  },
+  "license": "MIT"
+}
