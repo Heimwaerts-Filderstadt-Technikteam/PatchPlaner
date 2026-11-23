@@ -19,8 +19,18 @@ Läuft ohne Docker und ohne npm-Pakete: nur Node.js 22.13 oder neuer (SQLite ist
 - Zeichenwerkzeuge (Shift D): Rechteck, Kreis, Dreieck, Halbkreis, Trapez, Linie, Pfeil sowie Symbole für Person, Stuhl, Mikrofon, Lautsprecher, Scheinwerfer, Beamer, Kamera, Traverse, Treppe, Tür, Stromanschluss, Tisch, Leinwand, Rack – mit 8 Farben, 3 Füllungen, 3 Linienstärken, Beschriftung und Drehung
 - Rückgängig/Wiederholen, Raster, Mehrfachauswahl, Kopieren/Einfügen, Tastenkürzel (`?`), Kontextmenü, Touch mit Pinch-Zoom und langem Drücken
 
+**Ebenen (UG, EG, Empore …)**
+- Ebenen selbst anlegen, benennen (Doppelklick auf den Reiter über der Planfläche) und mit Fußbodenhöhe versehen; Wechsel per Reiter oder Bild ↑/↓
+- Jede Ebene bekommt ihren eigenen Grundriss: PDF (beliebige Seite) oder Bild. Ein mehrseitiges PDF wird einmal hochgeladen, weitere Seiten weist du anderen Ebenen direkt zu
+- „Nur die Zeichnung übernehmen“: weißes Papier wird durchsichtig, Linien und Beschriftungen bleiben (auch farbige) – die Ebenen liegen sauber übereinander
+- Zuschneiden, um Plankopf und Legende loszuwerden
+- Ist ein PDF-Grundriss kalibriert, übernehmen die anderen Seiten Maßstab und Lage automatisch
+- Andere Ebenen blass einblenden zum Ausrichten; Kabel zwischen Ebenen bekommen den Höhenunterschied automatisch zur Länge dazu (Steigleitung als ↕-Punkt)
+- Packliste nach Ebenen gruppiert, Patchliste mit Spalte „Ort“, PDF-Export mit einer Planseite je Ebene
+- 3D-Ansicht: alle Ebenen übereinander mit Grundrissen, Geräten, Kabeln und Steigleitungen; drehen, zoomen, Ebenen ein-/ausblenden, Abstand regeln, als PNG speichern
+
 **Grundrisse und Kabellängen**
-- Beliebig viele Grundrisse pro Plan (PNG, JPG, WebP, GIF, SVG oder PDF), z. B. eine pro Etage
+- Beliebig viele Grundrisse pro Plan (PNG, JPG, WebP, GIF, SVG oder PDF)
 - Maßstab mit zwei Punkten setzen oder bei PDFs den Zeichnungsmaßstab (1:100 …) eingeben
 - Grundrisse verschieben, ein-/ausblenden, Deckkraft, im Dark Mode invertieren
 - Messwerkzeug
@@ -107,3 +117,7 @@ Für ein vollständiges Backup beides sichern.
 ## PDF-Grundrisse ohne poppler
 
 Ohne `poppler-utils` wandelt der Browser PDFs mit pdf.js um. Das lädt pdf.js von cdnjs. Für Server ohne Internetzugang die Dateien `pdf.min.js` und `pdf.worker.min.js` (pdf.js 3.11.174) nach `public/vendor/` legen.
+
+## Fremdbibliotheken
+
+Die 3D-Ansicht nutzt [three.js](https://threejs.org) r147 (MIT-Lizenz), lokal unter `public/vendor/three/` – sie funktioniert also auch ohne Internet.

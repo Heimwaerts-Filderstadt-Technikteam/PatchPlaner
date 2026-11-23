@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { openDb, tx } from './lib/db.js';
 import { seed } from './lib/seed.js';
 import { sendMail, smtpConfigured } from './lib/mail.js';
+import { encodePNG, parsePPM, whiteToAlpha } from './lib/png.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 {
@@ -245,17 +246,37 @@ function imageSize(buf, mime) {
 function run(cmd, args, timeout = 60000) {
   return new Promise((resolve, reject) => execFile(cmd, args, { timeout, maxBuffer: 4 * 1048576 }, (e, out) => (e ? reject(e) : resolve(out))));
 }
-async function pdfToPng(buf) {
+async function pdfInfo(file) {
+  const out = { pages: 1, ptW: null };
+  try {
+    const info = await run('pdfinfo', [file]);
+    const p = info.match(/Pages:\s*(\d+)/i); if (p) out.pages = +p[1];
+  } catch { /* optional */ }
+  return out;
+}
+async function pageWidthPt(file, page) {
+  try { const info = await run('pdfinfo', ['-f', String(page), '-l', String(page), file]); const m = info.match(/Page\s+\d+\s+size:\s*([\d.]+)\s*x\s*([\d.]+)/i) || info.match(/Page size:\s*([\d.]+)\s*x\s*([\d.]+)/i); if (m) return parseFloat(m[1]); } catch { /* optional */ }
+  return null;
+}
+// Eine PDF-Seite als PNG rendern; transparent = weißer Hintergrund wird durchsichtig
+async function renderPdfPage(pdfPath, page, transparent) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'pp-'));
   try {
-    const inp = path.join(dir, 'in.pdf');
-    await fsp.writeFile(inp, buf);
-    let ptW = null;
-    try { const info = await run('pdfinfo', ['-f', '1', '-l', '1', inp]); const m = info.match(/Page\s+1?\s*size:\s*([\d.]+)\s*x\s*([\d.]+)/i) || info.match(/Page size:\s*([\d.]+)\s*x\s*([\d.]+)/i); if (m) ptW = parseFloat(m[1]); } catch { /* optional */ }
-    await run('pdftoppm', ['-png', '-f', '1', '-l', '1', '-singlefile', '-scale-to', '4000', inp, path.join(dir, 'out')]);
-    const png = await fsp.readFile(path.join(dir, 'out.png'));
-    const sz = imageSize(png, 'image/png');
-    return { png, ...sz, ptPerPx: ptW ? ptW / sz.w : null };
+    const info = await pdfInfo(pdfPath);
+    if (page < 1 || page > info.pages) throw bad(`Das PDF hat ${info.pages} Seite${info.pages === 1 ? '' : 'n'}. Seite ${page} gibt es nicht.`);
+    const ptW = await pageWidthPt(pdfPath, page);
+    let png, w, h;
+    if (transparent) {
+      await run('pdftoppm', ['-f', String(page), '-l', String(page), '-singlefile', '-scale-to', '3600', pdfPath, path.join(dir, 'out')], 120000);
+      const ppm = parsePPM(await fsp.readFile(path.join(dir, 'out.ppm')));
+      w = ppm.w; h = ppm.h;
+      png = encodePNG(whiteToAlpha(ppm.rgb, w, h), w, h);
+    } else {
+      await run('pdftoppm', ['-png', '-f', String(page), '-l', String(page), '-singlefile', '-scale-to', '4000', pdfPath, path.join(dir, 'out')], 120000);
+      png = await fsp.readFile(path.join(dir, 'out.png'));
+      ({ w, h } = imageSize(png, 'image/png'));
+    }
+    return { png, w, h, ptPerPx: ptW ? ptW / w : null, pages: info.pages };
   } finally { fsp.rm(dir, { recursive: true, force: true }).catch(() => {}); }
 }
 
@@ -318,7 +339,7 @@ function copyPlan(src, user, overrides = {}) {
         .run(nid, id, a.kind, a.mime, a.filename, file, a.w, a.h, a.meta, t);
       map[a.id] = nid;
     }
-    for (const f of data.floors || []) if (map[f.asset]) f.asset = map[f.asset];
+    for (const f of data.floors || []) { if (map[f.asset]) f.asset = map[f.asset]; if (f.src && map[f.src]) f.src = map[f.src]; }
     db.prepare('UPDATE plans SET data = ? WHERE id = ?').run(JSON.stringify(data), id);
     return id;
   });
@@ -631,24 +652,7 @@ route('DELETE', '/api/plans/:id/pack', async (ctx, { id }) => {
   broadcast(id, 'packreset', { by: u.name }, ctx.req.headers['x-client-id']);
   return { ok: true };
 });
-route('POST', '/api/plans/:id/assets', async (ctx, { id }) => {
-  const u = need(ctx); loadPlan(id, u, 'edit');
-  let mime = String(ctx.req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-  if (mime === 'image/jpg') mime = 'image/jpeg';
-  const okTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml', 'application/pdf'];
-  if (!okTypes.includes(mime)) throw bad('Bitte lade ein Bild (PNG, JPG, WebP, GIF, SVG) oder ein PDF hoch.');
-  let buf = await readBody(ctx.req, cfg.maxUploadMb * 1048576);
-  if (!buf.length) throw bad('Die Datei ist leer.');
-  const filename = str(decodeURIComponent(String(ctx.req.headers['x-filename'] || 'grundriss')), 200);
-  let meta = null;
-  if (mime === 'application/pdf') {
-    if (!hasPdftoppm) throw new HttpError(415, 'PDF-Umwandlung ist auf dem Server nicht verfügbar (poppler-utils fehlt).');
-    const r = await pdfToPng(buf);
-    buf = r.png; mime = 'image/png'; meta = { pdf: true, ptPerPx: r.ptPerPx };
-  } else if (ctx.req.headers['x-meta']) {
-    const m = J(decodeURIComponent(String(ctx.req.headers['x-meta'])), null);
-    if (m && typeof m.ptPerPx === 'number' && m.ptPerPx > 0) meta = { pdf: true, ptPerPx: m.ptPerPx };
-  }
+async function storeFloorAsset(planId, buf, mime, filename, meta) {
   if (mime === 'image/svg+xml' && /<script|on\w+\s*=|javascript:/i.test(buf.toString('utf8'))) throw bad('Die SVG-Datei enthält Skripte und wird aus Sicherheitsgründen abgelehnt.');
   const size = imageSize(buf, mime);
   if (!size) throw bad('Das Bild konnte nicht gelesen werden.');
@@ -656,8 +660,47 @@ route('POST', '/api/plans/:id/assets', async (ctx, { id }) => {
   const ext = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif', 'image/svg+xml': '.svg' }[mime];
   await fsp.writeFile(path.join(UPLOADS, aid + ext), buf);
   db.prepare('INSERT INTO plan_assets (id, plan_id, kind, mime, filename, file, w, h, meta, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(aid, id, 'floor', mime, filename, aid + ext, Math.round(size.w), Math.round(size.h), meta ? JSON.stringify(meta) : null, now());
+    .run(aid, planId, 'floor', mime, filename, aid + ext, Math.round(size.w), Math.round(size.h), meta ? JSON.stringify(meta) : null, now());
   return { id: aid, mime, w: Math.round(size.w), h: Math.round(size.h), meta, filename };
+}
+function uploadMeta(ctx) { return ctx.req.headers['x-meta'] ? J(decodeURIComponent(String(ctx.req.headers['x-meta'])), {}) || {} : {}; }
+route('POST', '/api/plans/:id/assets', async (ctx, { id }) => {
+  const u = need(ctx); loadPlan(id, u, 'edit');
+  let mime = String(ctx.req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (mime === 'image/jpg') mime = 'image/jpeg';
+  const okTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml', 'application/pdf'];
+  if (!okTypes.includes(mime)) throw bad('Bitte lade ein Bild (PNG, JPG, WebP, GIF, SVG) oder ein PDF hoch.');
+  const buf = await readBody(ctx.req, cfg.maxUploadMb * 1048576);
+  if (!buf.length) throw bad('Die Datei ist leer.');
+  const filename = str(decodeURIComponent(String(ctx.req.headers['x-filename'] || 'grundriss')), 200);
+  const um = uploadMeta(ctx);
+  if (mime === 'application/pdf') {
+    if (!hasPdftoppm) throw new HttpError(415, 'PDF-Umwandlung ist auf dem Server nicht verfügbar (poppler-utils fehlt).');
+    // Original-PDF aufbewahren, damit weitere Seiten (Ebenen) daraus gerendert werden können
+    const pid = uid();
+    const pdfPath = path.join(UPLOADS, pid + '.pdf');
+    await fsp.writeFile(pdfPath, buf);
+    const page = Math.max(1, Math.floor(+um.page || 1));
+    let r;
+    try { r = await renderPdfPage(pdfPath, page, um.transparent !== false); }
+    catch (e) { fs.rm(pdfPath, { force: true }, () => {}); throw e; }
+    db.prepare('INSERT INTO plan_assets (id, plan_id, kind, mime, filename, file, w, h, meta, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(pid, id, 'pdfsrc', 'application/pdf', filename, pid + '.pdf', null, null, JSON.stringify({ pages: r.pages }), now());
+    return storeFloorAsset(id, r.png, 'image/png', filename, { pdf: true, ptPerPx: r.ptPerPx, page, pages: r.pages, src: pid, transparent: um.transparent !== false });
+  }
+  const meta = typeof um.ptPerPx === 'number' && um.ptPerPx > 0 ? { pdf: true, ptPerPx: um.ptPerPx, page: um.page || 1, pages: um.pages || 1, transparent: !!um.transparent } : (um.transparent ? { transparent: true } : null);
+  return storeFloorAsset(id, buf, mime, filename, meta);
+});
+// Weitere Seite aus einem bereits hochgeladenen PDF rendern
+route('POST', '/api/plans/:id/assets/:aid/render', async (ctx, { id, aid }) => {
+  const u = need(ctx); loadPlan(id, u, 'edit');
+  const src = db.prepare("SELECT * FROM plan_assets WHERE id = ? AND plan_id = ? AND kind = 'pdfsrc'").get(aid, id);
+  if (!src) throw new HttpError(404, 'Das PDF ist nicht mehr vorhanden. Lade es neu hoch.');
+  if (!hasPdftoppm) throw new HttpError(415, 'PDF-Umwandlung ist auf dem Server nicht verfügbar (poppler-utils fehlt).');
+  const b = await jsonBody(ctx.req);
+  const page = Math.max(1, Math.floor(+b.page || 1));
+  const r = await renderPdfPage(path.join(UPLOADS, src.file), page, b.transparent !== false);
+  return storeFloorAsset(id, r.png, 'image/png', src.filename, { pdf: true, ptPerPx: r.ptPerPx, page, pages: r.pages, src: aid, transparent: b.transparent !== false });
 });
 route('GET', '/api/assets/:id', async (ctx, { id }) => {
   const a = db.prepare('SELECT a.*, p.owner_id, p.team_id, p.is_template, p.share_token, p.share_enabled FROM plan_assets a JOIN plans p ON p.id = a.plan_id WHERE a.id = ?').get(id);

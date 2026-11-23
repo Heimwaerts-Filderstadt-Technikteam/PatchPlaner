@@ -173,20 +173,49 @@ export function toCSV(rows) {
   return '﻿' + rows.map(r => r.map(cell).join(';')).join('\r\n');
 }
 
+/* ---------- Weißen Hintergrund entfernen (Farbe zu Alpha) ---------- */
+export function whiteToAlphaCanvas(cv) {
+  const c = cv.getContext('2d'); const img = c.getImageData(0, 0, cv.width, cv.height); const d = img.data; const floor = 0.06;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2], a0 = d[i + 3] / 255;
+    let a = Math.max(255 - r, 255 - g, 255 - b) / 255;
+    if (a < floor || a0 === 0) { d[i + 3] = 0; continue; }
+    a = Math.min(1, (a - floor) / (1 - floor) * 1.15);
+    const un = (v) => Math.max(0, Math.min(255, Math.round(255 - (255 - v) / Math.max(a, 0.01))));
+    d[i] = un(r); d[i + 1] = un(g); d[i + 2] = un(b); d[i + 3] = Math.round(a * a0 * 255);
+  }
+  c.putImageData(img, 0, 0);
+  return cv;
+}
+export async function imageToCanvas(src, maxDim = 4000) {
+  const url = src instanceof Blob ? URL.createObjectURL(src) : src;
+  try {
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('Das Bild konnte nicht gelesen werden.')); i.src = url; });
+    const k = Math.min(1, maxDim / Math.max(img.naturalWidth || 1600, img.naturalHeight || 1000));
+    const cv = document.createElement('canvas'); cv.width = Math.round((img.naturalWidth || 1600) * k); cv.height = Math.round((img.naturalHeight || 1000) * k);
+    const c = cv.getContext('2d'); c.drawImage(img, 0, 0, cv.width, cv.height);
+    return cv;
+  } finally { if (src instanceof Blob) URL.revokeObjectURL(url); }
+}
+// Bild-Datei oder -URL freistellen und als PNG-Blob liefern
+export async function whiteToAlphaBlob(src) { return canvasBlob(whiteToAlphaCanvas(await imageToCanvas(src)), 'image/png'); }
+
 /* ---------- PDF-Import im Browser (Fallback ohne poppler) ---------- */
-export async function pdfToPngBrowser(file) {
+export async function pdfToPngBrowser(file, pageNo = 1, transparent = true) {
   if (!window.pdfjsLib) {
     const tryLoad = (src) => new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
     try { await tryLoad('/vendor/pdf.min.js'); window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.js'; }
     catch { await tryLoad('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'); window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; }
   }
   const pdf = await window.pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
-  const page = await pdf.getPage(1);
+  if (pageNo < 1 || pageNo > pdf.numPages) throw new Error(`Das PDF hat ${pdf.numPages} Seite${pdf.numPages === 1 ? '' : 'n'}. Seite ${pageNo} gibt es nicht.`);
+  const page = await pdf.getPage(pageNo);
   const vp0 = page.getViewport({ scale: 1 });
-  const scale = Math.min(6, 4000 / Math.max(vp0.width, vp0.height));
+  const scale = Math.min(6, 3600 / Math.max(vp0.width, vp0.height));
   const vp = page.getViewport({ scale });
   const cv = document.createElement('canvas'); cv.width = Math.round(vp.width); cv.height = Math.round(vp.height);
   const c = cv.getContext('2d'); c.fillStyle = '#fff'; c.fillRect(0, 0, cv.width, cv.height);
   await page.render({ canvasContext: c, viewport: vp }).promise;
-  return { blob: await canvasBlob(cv, 'image/png'), ptPerPx: 1 / scale };
+  if (transparent) whiteToAlphaCanvas(cv);
+  return { blob: await canvasBlob(cv, 'image/png'), ptPerPx: 1 / scale, pages: pdf.numPages };
 }

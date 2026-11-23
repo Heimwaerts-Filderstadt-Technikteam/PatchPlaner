@@ -5,7 +5,7 @@ import { $, $$, esc, trunc, uid, clamp, toast, modal, armButton, copyText, downl
 import { layout, anchorOf, itemInner, clearLayoutCache, itemPreviewSVG } from './itemsvg.js';
 import { routeOrtho, simplify, pathWithHops, segmentsOf } from './routing.js';
 import { mountPortEditor, portSummary, typeOptions } from './builder.js';
-import { renderPlanCanvas, canvasBlob, buildPdf, toCSV, pdfToPngBrowser } from './export.js';
+import { renderPlanCanvas, canvasBlob, buildPdf, toCSV, pdfToPngBrowser, whiteToAlphaBlob } from './export.js';
 
 const MARGIN = 10, STUB = 18;
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -50,6 +50,12 @@ export async function openEditor(root, opts) {
     };
     s.items.forEach(it => { it.ports = it.ports || []; it.elements = it.elements || []; it.ports.forEach(p => { p.id = p.id || uid(); }); });
     s.cables.forEach(c => { c.wps = c.wps || []; c.extra = c.extra || 0; });
+    // Ebenen (UG, EG, Empore …): jedes Gerät, jede Form und jeder Grundriss gehört zu genau einer Ebene
+    const lv = Array.isArray(d.levels) && d.levels.length ? d.levels : [{ id: uid(), name: 'EG', elev: 0 }];
+    s.levels = lv.map(l => ({ id: l.id || uid(), name: String(l.name || 'Ebene'), elev: Number.isFinite(+l.elev) ? +l.elev : 0 }));
+    const lvIds = new Set(s.levels.map(l => l.id));
+    for (const o of [...s.items, ...s.shapes, ...s.floors]) if (!lvIds.has(o.lv)) o.lv = s.levels[0].id;
+    s.packLevels = d.packLevels ?? true;
     return s;
   }
 
@@ -85,6 +91,7 @@ export async function openEditor(root, opts) {
         </div>
         <div class="grp">
           ${readonly ? '' : '<button data-act="share">Teilen</button>'}
+          <button data-act="3d" title="3D-Ansicht aller Ebenen">3D</button>
           <button data-act="export">Export</button>
           <button data-act="help" title="Tastenkürzel (?)" aria-label="Hilfe">?</button>
         </div>
@@ -112,6 +119,7 @@ export async function openEditor(root, opts) {
             <g id="lZones"></g><g id="lShapes"></g><g id="lCables"></g><g id="lItems"></g><g id="lText"></g><g id="lOver"></g>
           </g>
         </svg>
+        <div class="lvbar" id="lvbar" role="tablist" aria-label="Ebenen"></div>
         <div class="dtb" id="dtb" hidden></div>
         <div class="legend" id="legend" hidden></div>
         <div class="scalebar" id="scalebar"></div>
@@ -127,7 +135,7 @@ export async function openEditor(root, opts) {
       </aside>
     </div>
     <div class="ctx" id="ctx" hidden></div>
-    <input type="file" id="fFloor" accept="image/*,.pdf,application/pdf" hidden>
+
     <input type="file" id="fJson" accept=".json,application/json" hidden>
   </div>`;
   const E = root.querySelector('.editor');
@@ -142,12 +150,30 @@ export async function openEditor(root, opts) {
   let fastRoute = false;
   const routeCache = new Map();
   let presenceList = [];
+  const LVKEY = 'pp.lv.' + (planId || shareToken);
+  let curLv = (() => { try { return localStorage.getItem(LVKEY); } catch { return null; } })();
+  let ghosts = (() => { try { return localStorage.getItem('pp.ghosts') !== '0'; } catch { return true; } })();
+  let shownGhosts = new Set();
+  let cropFloor = null, renamingLv = null;
 
   const itemById = (id) => S.items.find(i => i.id === id);
   const shapeById = (id) => S.shapes.find(s => s.id === id);
   const cableById = (id) => S.cables.find(c => c.id === id);
   const floorById = (id) => S.floors.find(f => f.id === id);
   const portOf = (it, pid) => it && it.ports.find(p => p.id === pid);
+  const lvById = (id) => S.levels.find(l => l.id === id) || S.levels[0];
+  let freshLv = null;
+  const lvSorted = () => [...S.levels].sort((a, b) => b.elev - a.elev);
+  const onLv = (o) => o.lv === curLv;
+  function ensureLv() {
+    if (!S.levels.some(l => l.id === curLv)) curLv = (S.levels.find(l => l.name === 'EG') || S.levels.find(l => l.elev === 0) || S.levels[0]).id;
+  }
+  ensureLv();
+  const isCross = (c) => { const a = itemById(c.from.item), b = itemById(c.to.item); return !!(a && b && a.lv !== b.lv); };
+  const lvDiff = (c) => { const a = itemById(c.from.item), b = itemById(c.to.item); return a && b && a.lv !== b.lv ? Math.abs(lvById(a.lv).elev - lvById(b.lv).elev) : 0; };
+  // nächste Ebene unter der aktuellen (für die blasse Grundriss-Einblendung)
+  function lvBelow(id) { const cur = lvById(id); const lower = S.levels.filter(l => l.elev < cur.elev).sort((a, b) => b.elev - a.elev)[0]; return lower || S.levels.filter(l => l.id !== id).sort((a, b) => a.elev - b.elev)[0] || null; }
+  const cropOf = (f) => { const a = assets.get(f.asset); return f.crop || { x: 0, y: 0, w: a ? a.w : f.w, h: a ? a.h : f.h }; };
 
   /* ---------- Speichern ---------- */
   let dirty = false, saving = false, saveAgain = false, conflict = false, lastThumb = 0, retryT = null, changeSeq = 0;
@@ -226,7 +252,7 @@ export async function openEditor(root, opts) {
   function doUndo() { if (!undoS.length) return; redoS.push(snapshot()); S = JSON.parse(undoS.pop()); cleanSel(); clearLayoutCache(); changed(); }
   function doRedo() { if (!redoS.length) return; undoS.push(snapshot()); S = JSON.parse(redoS.pop()); cleanSel(); clearLayoutCache(); changed(); }
   function updUndo() { const u = $('#bUndo', E), r = $('#bRedo', E); if (u) u.disabled = !undoS.length; if (r) r.disabled = !redoS.length; }
-  function cleanSel() { for (const id of [...sel.ids]) if (!itemById(id) && !shapeById(id)) sel.ids.delete(id); if (sel.cable && !cableById(sel.cable)) sel.cable = null; }
+  function cleanSel() { ensureLv(); for (const id of [...sel.ids]) if (!itemById(id) && !shapeById(id)) sel.ids.delete(id); if (sel.cable && !cableById(sel.cable)) sel.cable = null; if (sel.floor && !floorById(sel.floor)) sel.floor = null; }
 
   /* ---------- Geometrie ---------- */
   const lay = (it) => layout(it, S.orient);
@@ -240,11 +266,12 @@ export async function openEditor(root, opts) {
     if (!hA && !hB) { const my = (A2.y + B2.y) / 2; return [A2, { x: A2.x, y: my }, { x: B2.x, y: my }, B2]; }
     return hA ? [A2, { x: B2.x, y: A2.y }, B2] : [A2, { x: A2.x, y: B2.y }, B2];
   }
-  function obstaclesFor(A2, B2) {
+  function obstaclesFor(A2, B2, lvs) {
     const r = Math.max(160, dist(A2, B2) * 0.6);
     const bx = { x: Math.min(A2.x, B2.x) - r, y: Math.min(A2.y, B2.y) - r, x2: Math.max(A2.x, B2.x) + r, y2: Math.max(A2.y, B2.y) + r };
     const out = [];
     for (const it of S.items) {
+      if (lvs && !lvs.has(it.lv)) continue;
       const b = itemBox(it);
       if (b.x + b.w < bx.x || b.x > bx.x2 || b.y + b.h < bx.y || b.y > bx.y2) continue;
       out.push({ x: b.x - MARGIN, y: b.y - MARGIN, w: b.w + 2 * MARGIN, h: b.h + 2 * MARGIN });
@@ -261,7 +288,7 @@ export async function openEditor(root, opts) {
     const rmode = c.route || S.settings.route;
     if (rmode === 'direct') return [A, A2, B2, B];
     if (rmode === 'ortho') return [A, ...simpleOrtho(A2, B2), B];
-    const obs = obstaclesFor(A2, B2);
+    const obs = obstaclesFor(A2, B2, new Set([a.lv, b.lv]));
     const key = `${A2.x.toFixed(1)},${A2.y.toFixed(1)},${A2.side}|${B2.x.toFixed(1)},${B2.y.toFixed(1)},${B2.side}|` + obs.map(o => `${o.x.toFixed(0)},${o.y.toFixed(0)},${o.w.toFixed(0)},${o.h.toFixed(0)}`).join(';');
     let r = routeCache.get(c.id);
     if ((!r || r.key !== key) && fastRoute) return [A, ...simpleOrtho(A2, B2), B];
@@ -290,10 +317,10 @@ export async function openEditor(root, opts) {
   function calc(c, pts) {
     pts = pts || cablePts(c); if (!pts) return null; const s = S.settings;
     if (typeOf(c.type).nocable) return { pts, geo: polyLen(pts) / U, slack: 0, height: 0, extra: 0, reserve: 0, total: 0, final: 0, pack: { len: 0 }, nocable: true };
-    const geo = polyLen(pts) / U, slack = 2 * (+s.endSlack || 0), height = +s.heightAdd || 0, extra = +c.extra || 0;
-    const sub = geo + slack + height + extra, reserve = sub * ((+s.reserve || 0) / 100), total = sub + reserve;
+    const geo = polyLen(pts) / U, slack = 2 * (+s.endSlack || 0), height = +s.heightAdd || 0, extra = +c.extra || 0, lvh = lvDiff(c);
+    const sub = geo + slack + height + extra + lvh, reserve = sub * ((+s.reserve || 0) / 100), total = sub + reserve;
     const final = c.override > 0 ? +c.override : total;
-    return { pts, geo, slack, height, extra, reserve, total, final, pack: packLen(c.type, final) };
+    return { pts, geo, slack, height, extra, lvh, reserve, total, final, pack: packLen(c.type, final) };
   }
   function cableIds() { const cnt = {}, ids = {}; S.cables.forEach(c => { const t = typeOf(c.type); cnt[c.type] = (cnt[c.type] || 0) + 1; ids[c.id] = c.label || (t.short + ' ' + String(cnt[c.type]).padStart(2, '0')); }); return ids; }
   function adaptersOf(c) {
@@ -303,7 +330,7 @@ export async function openEditor(root, opts) {
   }
   function isBi(c) { const a = portOf(itemById(c.from.item), c.from.port), b = portOf(itemById(c.to.item), c.to.port); return typeOf(c.type).bi || (a && b && a.dir === 'io' && b.dir === 'io'); }
   function connMap() { const m = new Map(); S.cables.forEach(c => { m.set(c.from.item + '/' + c.from.port, c); m.set(c.to.item + '/' + c.to.port, c); }); return m; }
-  function zoneOf(p) { for (let i = S.shapes.length - 1; i >= 0; i--) { const z = S.shapes[i]; if (z.kind === 'zone' && p.x >= z.x && p.x <= z.x + z.w && p.y >= z.y && p.y <= z.y + z.h) return z; } return null; }
+  function zoneOf(p, lv) { for (let i = S.shapes.length - 1; i >= 0; i--) { const z = S.shapes[i]; if (z.kind === 'zone' && (!lv || z.lv === lv) && p.x >= z.x && p.x <= z.x + z.w && p.y >= z.y && p.y <= z.y + z.h) return z; } return null; }
   const itemName = (it) => it.label || it.name;
 
   /* ---------- Rendern ---------- */
@@ -314,11 +341,11 @@ export async function openEditor(root, opts) {
     world.setAttribute('transform', `translate(${view.x} ${view.y}) scale(${z})`);
     svg.setAttribute('class', `mode-${drawTool ? 'draw' : mode}${hlType ? ' hl' : ''}${drag && drag.kind === 'pan' ? ' panning' : ''}`);
     // Grundrisse
-    $('#lFloors', E).innerHTML = S.floors.filter(f => f.visible !== false).map(f => {
-      const a = assets.get(f.asset); if (!a) return '';
-      return `<image class="floorimg${f.invert ? ' inv' : ''}${f.locked === false && !readonly ? ' unlocked' : ''}" data-floor="${f.id}" href="${assetUrl(f.asset)}" x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}" opacity="${f.opacity ?? 0.9}" preserveAspectRatio="none"/>` +
-        (sel.floor === f.id ? `<rect class="selrect" x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}"/>` : '');
-    }).join('');
+    const below = ghosts ? lvBelow(curLv) : null;
+    $('#lFloors', E).innerHTML =
+      (below ? S.floors.filter(f => f.visible !== false && f.lv === below.id).map(f => floorSVG(f, true)).join('') : '') +
+      S.floors.filter(f => f.visible !== false && onLv(f)).map(f => floorSVG(f, false) +
+        (sel.floor === f.id ? `<rect class="selrect" x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}"/>` : '')).join('');
     // Raster
     const r = svg.getBoundingClientRect(), x0 = -view.x / z, y0 = -view.y / z, w = r.width / z, h = r.height / z;
     const minor = z > 0.9 ? 10 : U;
@@ -326,12 +353,14 @@ export async function openEditor(root, opts) {
     $('#gMinP', E).setAttribute('d', `M${minor} 0V${minor}H0`); $('#gMinP', E).setAttribute('stroke-width', 1 / z);
     $('#gMajP', E).setAttribute('d', 'M250 0V250H0'); $('#gMajP', E).setAttribute('stroke-width', 1.2 / z);
     ['gridA', 'gridB'].forEach(id => { const g = $('#' + id, E); g.setAttribute('x', x0); g.setAttribute('y', y0); g.setAttribute('width', w); g.setAttribute('height', h); g.style.display = S.grid ? '' : 'none'; });
-    $('#lZones', E).innerHTML = S.shapes.filter(s => s.kind === 'zone').map(shapeSVG).join('');
-    $('#lShapes', E).innerHTML = S.shapes.filter(s => s.kind !== 'zone' && s.kind !== 'text').map(shapeSVG).join('');
-    $('#lText', E).innerHTML = S.shapes.filter(s => s.kind === 'text').map(shapeSVG).join('');
+    const shp = S.shapes.filter(onLv);
+    $('#lZones', E).innerHTML = shp.filter(s => s.kind === 'zone').map(shapeSVG).join('');
+    $('#lShapes', E).innerHTML = shp.filter(s => s.kind !== 'zone' && s.kind !== 'text').map(shapeSVG).join('');
+    $('#lText', E).innerHTML = shp.filter(s => s.kind === 'text').map(shapeSVG).join('');
     // Kabel
     const ids = cableIds();
-    const polys = S.cables.map(c => ({ c, pts: cablePts(c) }));
+    const visCables = S.cables.filter(c => { const a = itemById(c.from.item), b = itemById(c.to.item); return a && b && (onLv(a) || onLv(b)); });
+    const polys = visCables.map(c => ({ c, pts: cablePts(c) }));
     const earlier = [];
     let co = '';
     for (const { c, pts } of polys) {
@@ -341,17 +370,33 @@ export async function openEditor(root, opts) {
     }
     $('#lCables', E).innerHTML = co;
     const cm = connMap();
-    $('#lItems', E).innerHTML = S.items.map(it => {
+    // Geräte anderer Ebenen: blass, wenn eingeblendet oder per Kabel mit dieser Ebene verbunden
+    shownGhosts = new Set();
+    if (ghosts) S.items.forEach(it => { if (!onLv(it)) shownGhosts.add(it.id); });
+    visCables.forEach(c => { [c.from.item, c.to.item].forEach(id => { const it = itemById(id); if (it && !onLv(it)) shownGhosts.add(id); }); });
+    const itemG = (it, ghost) => {
       const inner = itemInner(it, S.orient, (p) => cm.has(it.id + '/' + p.id));
-      return `<g class="item${sel.ids.has(it.id) ? ' sel' : ''}" data-item="${it.id}" transform="translate(${it.x} ${it.y}) scale(${S.ds})">${inner.svg}</g>`;
-    }).join('');
+      const tag = ghost ? `<text class="t-ghost" x="0" y="${-20}">↕ ${esc(lvById(it.lv).name)}</text>` : '';
+      return `<g class="item${ghost ? ' ghost' : ''}${sel.ids.has(it.id) ? ' sel' : ''}" data-item="${it.id}"${ghost ? ' data-ghost="1"' : ''} transform="translate(${it.x} ${it.y}) scale(${S.ds})">${tag}${inner.svg}</g>`;
+    };
+    $('#lItems', E).innerHTML = S.items.filter(it => shownGhosts.has(it.id)).map(it => itemG(it, true)).join('') + S.items.filter(onLv).map(it => itemG(it, false)).join('');
     $('#lOver', E).innerHTML = overlaySVG();
     const nice = [0.5, 1, 2, 5, 10, 20, 50, 100, 200];
     const unitM = units.mode === 'ft' ? M_PER_FT : 1;
     const m = nice.find(n => n * unitM * U * z >= 70) || 200;
     $('#scalebar', E).innerHTML = `${m.toLocaleString('de-DE')} ${uName()}<div style="width:${m * unitM * U * z}px"></div>`;
     $('#zoomlbl', E).textContent = Math.round(z * 100) + ' %';
-    renderLegend(); renderHud();
+    renderLegend(); renderHud(); renderLvBar();
+  }
+  function floorSVG(f, ghost) {
+    const a = assets.get(f.asset); if (!a) return '';
+    const c = cropOf(f);
+    // Zuschnitt per clipPath (ein verschachteltes <svg viewBox> wird beim Bild-/PDF-Export falsch skaliert)
+    const sx = f.w / c.w, sy = f.h / c.h, cid = `fc-${f.id}${ghost ? '-g' : ''}`, unl = !ghost && f.locked === false && !readonly;
+    return `<g class="floorimg${f.invert ? ' inv' : ''}${ghost ? ' ghostfloor' : ''}${unl ? ' unlocked' : ''}"${ghost ? '' : ` data-floor="${f.id}"`} opacity="${ghost ? 0.22 : (f.opacity ?? 0.9)}">` +
+      `<clipPath id="${cid}"><rect x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}"/></clipPath>` +
+      `<image href="${assetUrl(f.asset)}" x="${f.x - c.x * sx}" y="${f.y - c.y * sy}" width="${a.w * sx}" height="${a.h * sy}" preserveAspectRatio="none" clip-path="url(#${cid})"/>` +
+      (unl ? `<rect class="floorframe" x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}"/>` : '') + '</g>';
   }
   function cableSVG(c, pts, ids, earlier) {
     const r = calc(c, pts); const t = typeOf(c.type), z = view.z;
@@ -365,9 +410,14 @@ export async function openEditor(root, opts) {
       o += `<path class="arrow" d="M${-s} ${-s} L${s} 0 L${-s} ${s}" stroke="${t.color}" transform="translate(${ax} ${ay}) rotate(${ang * 180 / Math.PI})"/>`;
     }
     if (S.labels && bl * z > 26) {
-      const txt = t.nocable ? `${ids[c.id]} · Funk` : `${ids[c.id]} · ${fmtLen(r.pack.len)}${ad ? ' ⚠' : ''}${c.override > 0 ? ' ✎' : ''}`;
+      const txt = t.nocable ? `${ids[c.id]} · Funk` : `${ids[c.id]} · ${fmtLen(r.pack.len)}${isCross(c) ? ' ↕' : ''}${ad ? ' ⚠' : ''}${c.override > 0 ? ' ✎' : ''}`;
       const fs = 10.5 / z, tw = txt.length * fs * 0.6 + 10 / z, th = fs + 7 / z;
       o += `<g class="pillg" transform="translate(${mx} ${my})"><rect class="pill" x="${-tw / 2}" y="${-th / 2}" width="${tw}" height="${th}" rx="${th / 2}" stroke="${t.color}"/><text class="t-pill" font-size="${fs}" text-anchor="middle" y="${fs * 0.36}">${esc(txt)}</text></g>`;
+    }
+    if (isCross(c)) {
+      const a2 = itemById(c.from.item), b2 = itemById(c.to.item), far = onLv(a2) ? b2 : a2, P = onLv(a2) ? pts[pts.length - 1] : pts[0], rr = 7 / z;
+      o += `<g class="riser"><circle cx="${P.x}" cy="${P.y}" r="${rr}" stroke="${t.color}"/><text x="${P.x}" y="${P.y + rr * 0.45}" font-size="${rr * 1.3}" text-anchor="middle">↕</text></g>`;
+      void far;
     }
     if (sel.cable === c.id && !readonly) (c.wps || []).forEach((w, i) => { o += `<circle class="wp" data-wp="${i}" cx="${w.x}" cy="${w.y}" r="${6 / z}"><title>Pin – ziehen zum Verschieben, Doppelklick entfernt ihn</title></circle>`; });
     return o + '</g>';
@@ -465,7 +515,8 @@ export async function openEditor(root, opts) {
       }
     }
     if (drag && drag.kind === 'link' && drag.cur) o += `<line class="templink" x1="${drag.a.x}" y1="${drag.a.y}" x2="${drag.cur.x}" y2="${drag.cur.y}"/>`;
-    if (drag && drag.kind === 'box' && drag.cur) { const b = normBox(drag.p0, drag.cur); o += `<rect class="selbox" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}"/>`; }
+    if (drag && (drag.kind === 'box' || drag.kind === 'cropbox') && drag.cur) { const b = normBox(drag.p0, drag.cur); o += `<rect class="selbox${drag.kind === 'cropbox' ? ' crop' : ''}" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}"/>`; }
+    if (mode === 'crop' && floorById(cropFloor)) { const f = floorById(cropFloor); o += `<rect class="cropframe" x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}"/>`; }
     if (drag && drag.kind === 'draw' && drag.preview) o += shapeSVG(drag.preview);
     const ms = mode === 'calib' ? calib : mode === 'measure' ? measure : null;
     if (ms && ms.p1) {
@@ -492,12 +543,17 @@ export async function openEditor(root, opts) {
   /* ---------- HUD ---------- */
   function renderHud() {
     const h = $('#hud', E);
+    if (mode === 'crop') {
+      h.hidden = false;
+      h.innerHTML = `<b>Zuschneiden</b><span>Ziehe einen Rahmen um den Teil des Grundrisses, der bleiben soll – z. B. ohne Plankopf und Legende.</span><button class="btn sm" data-act="cancelMode">Abbrechen</button>`;
+      return;
+    }
     if (mode === 'calib') {
       h.hidden = false;
       if (!S.floors.length) { h.innerHTML = `<b>Maßstab</b><span>Lade zuerst einen Grundriss.</span><button class="btn sm pri" data-act="addFloor">Grundriss laden</button><button class="btn sm" data-act="cancelMode">Abbrechen</button>`; return; }
-      const fl = floorById(calib?.floor) || S.floors[0];
+      const fl = floorById(calib?.floor) || S.floors.find(onLv) || S.floors[0];
       if (!calib || !calib.p2) {
-        h.innerHTML = `<b>Maßstab</b>${S.floors.length > 1 ? `<select class="inp sm" id="calFloor">${S.floors.map(f => `<option value="${f.id}"${f.id === fl.id ? ' selected' : ''}>${esc(f.name)}</option>`).join('')}</select>` : ''}<span>${calib && calib.p1 ? 'Zweiten Punkt anklicken.' : 'Klicke zwei Punkte mit bekanntem Abstand, z. B. die Enden einer Bemaßung.'}</span><button class="btn sm" data-act="cancelMode">Abbrechen</button>`;
+        h.innerHTML = `<b>Maßstab</b>${S.floors.length > 1 ? `<select class="inp sm" id="calFloor">${S.floors.map(f => `<option value="${f.id}"${f.id === fl.id ? ' selected' : ''}>${esc(lvById(f.lv).name)} · ${esc(f.name)}</option>`).join('')}</select>` : ''}<span>${calib && calib.p1 ? 'Zweiten Punkt anklicken.' : 'Klicke zwei Punkte mit bekanntem Abstand, z. B. die Enden einer Bemaßung.'}</span><button class="btn sm" data-act="cancelMode">Abbrechen</button>`;
         return;
       }
       if (!h.querySelector('#calM')) {
@@ -524,13 +580,15 @@ export async function openEditor(root, opts) {
     const r = svg.getBoundingClientRect(); if (cx == null) { cx = r.width / 2; cy = r.height / 2; }
     z = clamp(z, 0.04, 6); const wx = (cx - view.x) / view.z, wy = (cy - view.y) / view.z; view.z = z; view.x = cx - wx * z; view.y = cy - wy * z; render();
   }
-  function contentBounds(withFloors = true) {
+  function contentBounds(withFloors = true, lv = curLv) {
     let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
     const add = (b) => { x1 = Math.min(x1, b.x); y1 = Math.min(y1, b.y); x2 = Math.max(x2, b.x + b.w); y2 = Math.max(y2, b.y + b.h); };
-    if (withFloors) S.floors.filter(f => f.visible !== false).forEach(f => add(f));
-    S.items.forEach(it => add(itemBox(it)));
-    S.shapes.forEach(s => { const b = shapeBox(s); add(s.kind === 'zone' ? { x: b.x, y: b.y - 26, w: b.w, h: b.h + 26 } : b); });
-    S.cables.forEach(c => { const p = cablePts(c); if (p) p.forEach(w => add({ x: w.x, y: w.y, w: 0, h: 0 })); });
+    const inLv = (o) => !lv || o.lv === lv;
+    if (withFloors) S.floors.filter(f => f.visible !== false && inLv(f)).forEach(f => add(f));
+    S.items.filter(inLv).forEach(it => add(itemBox(it)));
+    S.shapes.filter(inLv).forEach(s => { const b = shapeBox(s); add(s.kind === 'zone' ? { x: b.x, y: b.y - 26, w: b.w, h: b.h + 26 } : b); });
+    S.cables.forEach(c => { const a = itemById(c.from.item), b = itemById(c.to.item); if (!a || !b || !(inLv(a) || inLv(b))) return; const p = cablePts(c); if (p) p.forEach(w => add({ x: w.x, y: w.y, w: 0, h: 0 })); });
+    if (x1 === Infinity && lv) { const all = S.floors.filter(f => f.visible !== false); if (all.length) { all.forEach(add); return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }; } }
     if (x1 === Infinity) return { x: 0, y: 0, w: 20 * U, h: 12 * U };
     return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
   }
@@ -546,6 +604,7 @@ export async function openEditor(root, opts) {
 
   /* ---------- Änderungen ---------- */
   function changed(dirtyIt = true) {
+    ensureLv();
     render(); renderPane();
     if (dirtyIt) markDirty();
     updUndo();
@@ -559,11 +618,11 @@ export async function openEditor(root, opts) {
   }
   function addGear(g, at) {
     pushUndo(); const p = at || viewCenter();
-    const it = newItemFromGear(g, p.x, p.y);
+    const it = newItemFromGear(g, p.x, p.y); it.lv = curLv;
     const b = itemBox(it); it.x = snapV(p.x - b.w / 2); it.y = snapV(p.y - 20);
     if (!at) {
       // Nicht auf ein vorhandenes Gerät legen: nach rechts unten ausweichen
-      const hits = () => { const b2 = itemBox(it); return S.items.some(o => { const ob = itemBox(o); return b2.x < ob.x + ob.w + 10 && b2.x + b2.w + 10 > ob.x && b2.y < ob.y + ob.h + 10 && b2.y + b2.h + 10 > ob.y; }); };
+      const hits = () => { const b2 = itemBox(it); return S.items.some(o => { if (o.lv !== it.lv) return false; const ob = itemBox(o); return b2.x < ob.x + ob.w + 10 && b2.x + b2.w + 10 > ob.x && b2.y < ob.y + ob.h + 10 && b2.y + b2.h + 10 > ob.y; }); };
       for (let i = 0; i < 60 && hits(); i++) { it.x = snapV(it.x + 40); if (i % 6 === 5) { it.x = snapV(p.x - b.w / 2); it.y = snapV(it.y + 60); } }
     }
     S.items.push(it); sel = { ids: new Set([it.id]), cable: null }; tab = 'sel'; changed();
@@ -622,8 +681,8 @@ export async function openEditor(root, opts) {
     pushUndo(); const nids = new Set();
     const all = [...c.items.map(i => ({ x: i.x, y: i.y })), ...c.shapes.map(s => ({ x: s.x, y: s.y }))];
     const minX = Math.min(...all.map(p => p.x)), minY = Math.min(...all.map(p => p.y)); const vc = viewCenter();
-    c.items.forEach(i => { const n = JSON.parse(JSON.stringify(i)); n.id = uid(); n.ports.forEach(p => { p.id = uid(); }); n.x = snapV(vc.x + i.x - minX); n.y = snapV(vc.y + i.y - minY); S.items.push(n); nids.add(n.id); });
-    c.shapes.forEach(s => { const n = JSON.parse(JSON.stringify(s)); n.id = uid(); n.x = snapV(vc.x + s.x - minX); n.y = snapV(vc.y + s.y - minY); S.shapes.push(n); nids.add(n.id); });
+    c.items.forEach(i => { const n = JSON.parse(JSON.stringify(i)); n.id = uid(); n.lv = curLv; n.ports.forEach(p => { p.id = uid(); }); n.x = snapV(vc.x + i.x - minX); n.y = snapV(vc.y + i.y - minY); S.items.push(n); nids.add(n.id); });
+    c.shapes.forEach(s => { const n = JSON.parse(JSON.stringify(s)); n.id = uid(); n.lv = curLv; n.x = snapV(vc.x + s.x - minX); n.y = snapV(vc.y + s.y - minY); S.shapes.push(n); nids.add(n.id); });
     sel = { ids: nids, cable: null }; changed();
   }
 
@@ -631,35 +690,210 @@ export async function openEditor(root, opts) {
   function scaleFloor(f, factor) {
     // Gibt es keinen anderen kalibrierten Grundriss, wird der ganze Plan mitskaliert; sonst nur der Inhalt dieses Grundrisses.
     const alone = !S.floors.some(o => o !== f && o.calibrated);
-    const ox = f.x, oy = f.y, inF = (p) => alone || (p.x >= f.x && p.x <= f.x + f.w && p.y >= f.y && p.y <= f.y + f.h);
+    const ox = f.x, oy = f.y, inF = (p, lv) => alone || ((!lv || lv === f.lv) && p.x >= f.x && p.x <= f.x + f.w && p.y >= f.y && p.y <= f.y + f.h);
     const sc = (p) => ({ x: ox + (p.x - ox) * factor, y: oy + (p.y - oy) * factor });
-    S.items.forEach(it => { const c = center(it); if (inF(c)) { const nc = sc(c); it.x += nc.x - c.x; it.y += nc.y - c.y; } });
-    S.shapes.forEach(s => { const b = shapeBox(s); const c = { x: b.x + b.w / 2, y: b.y + b.h / 2 }; if (!inF(c)) return; const p = sc({ x: s.x, y: s.y }); s.x = p.x; s.y = p.y; if (s.kind !== 'text' && s.kind !== 'sym') { s.w *= factor; s.h *= factor; } });
+    S.items.forEach(it => { const c = center(it); if (inF(c, it.lv)) { const nc = sc(c); it.x += nc.x - c.x; it.y += nc.y - c.y; } });
+    S.shapes.forEach(s => { const b = shapeBox(s); const c = { x: b.x + b.w / 2, y: b.y + b.h / 2 }; if (!inF(c, s.lv)) return; const p = sc({ x: s.x, y: s.y }); s.x = p.x; s.y = p.y; if (s.kind !== 'text' && s.kind !== 'sym') { s.w *= factor; s.h *= factor; } });
     S.cables.forEach(c => { c.wps = (c.wps || []).map(w => (inF(w) ? sc(w) : w)); });
-    S.floors.forEach(o => { if (o !== f && !o.calibrated && inF({ x: o.x, y: o.y })) { const p = sc(o); o.x = p.x; o.y = p.y; } });
+    S.floors.forEach(o => { if (o !== f && !o.calibrated && inF({ x: o.x, y: o.y })) { const p = sc(o); o.x = p.x; o.y = p.y; if (alone) { o.w *= factor; o.h *= factor; } } });
     f.w *= factor; f.h *= factor;
   }
-  async function uploadFloor(file) {
+  /* Grundriss für eine Ebene laden: Bild oder PDF-Seite, auf Wunsch nur die Zeichnung (transparent) */
+  const isPdfFile = (f) => f && (f.type === 'application/pdf' || /\.pdf$/i.test(f.name));
+  const pdfSources = () => [...assets.values()].filter(a => a.kind === 'pdfsrc');
+  function openFloorDialog({ file = null, lv = curLv, srcPdf = null, replaceFloor = null } = {}) {
     if (readonly) return;
-    const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
-    toast(isPdf ? 'PDF wird umgewandelt …' : 'Grundriss wird hochgeladen …', 15000);
-    try {
-      let res;
-      if (isPdf && config && config.pdfServer) res = await api.upload(`/api/plans/${planId}/assets`, file, 'application/pdf', file.name);
-      else if (isPdf) { const r = await pdfToPngBrowser(file); res = await api.upload(`/api/plans/${planId}/assets`, r.blob, 'image/png', file.name.replace(/\.pdf$/i, '.png'), { ptPerPx: r.ptPerPx }); }
-      else res = await api.upload(`/api/plans/${planId}/assets`, file, file.type || 'image/png', file.name);
-      assets.set(res.id, res);
-      pushUndo();
-      const k = 1600 / Math.max(res.w, res.h);
-      const b = S.floors.length ? contentBounds() : { x: 0, y: 0, w: 0, h: 0 };
-      const f = { id: uid(), asset: res.id, name: file.name.replace(/\.[^.]+$/, '') || 'Grundriss', x: S.floors.length ? snapV(b.x + b.w + 2 * U) : 0, y: S.floors.length ? snapV(b.y) : 0,
-        w: res.w * k, h: res.h * k, w0: res.w, opacity: 0.9, visible: true, invert: true, calibrated: false, locked: true, pdf: res.meta && res.meta.ptPerPx ? { ptPerPx: res.meta.ptPerPx } : null };
-      S.floors.push(f); changed(); fit(f);
-      tab = 'plan'; renderPane();
-      if (f.pdf) toast('PDF geladen. Gib im Plan-Tab den Zeichnungsmaßstab ein (z. B. 1:100) oder setze den Maßstab mit zwei Punkten.', 6000);
-      else { setMode('calib'); calib = { floor: f.id }; toast('Grundriss geladen. Klicke jetzt zwei Punkte mit bekanntem Abstand.', 5000); }
-    } catch (e) { toast(e.message || 'Der Grundriss konnte nicht geladen werden.', 6000, 'bad'); }
+    let chosen = file;
+    const srcs = pdfSources();
+    const m = modal(`<header><h2>Grundriss für eine Ebene</h2><button class="btn sm" data-x>Schließen</button></header>
+      <div class="mb">
+        <label class="row"><span>Ebene</span><select class="inp" id="fdLv">${lvSorted().map(l => `<option value="${l.id}"${l.id === lv ? ' selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
+        <div class="sec"><h3>Quelle</h3>
+          <div class="fdsrc">
+            <label class="chk"><input type="radio" name="fdS" value="file"${srcPdf ? '' : ' checked'}> Datei (PDF oder Bild)</label>
+            <div class="inline" id="fdFileRow"><input type="file" id="fdFile" accept="image/*,.pdf,application/pdf"><span class="small muted" id="fdFileName">${chosen ? esc(chosen.name) : ''}</span></div>
+            ${srcs.length ? `<label class="chk"><input type="radio" name="fdS" value="pdf"${srcPdf ? ' checked' : ''}> Aus einem schon geladenen PDF</label>
+            <select class="inp" id="fdPdf">${srcs.map(a => `<option value="${a.id}"${a.id === srcPdf ? ' selected' : ''}>${esc(a.filename || 'PDF')} – ${a.meta?.pages || 1} Seite${(a.meta?.pages || 1) === 1 ? '' : 'n'}</option>`).join('')}</select>` : ''}
+          </div>
+        </div>
+        <label class="row" id="fdPageRow"><span>PDF-Seite</span><input class="inp" id="fdPage" type="number" min="1" value="1" style="max-width:110px"></label>
+        <label class="chk big"><input type="checkbox" id="fdTr" checked> Nur die Zeichnung übernehmen (weißen Hintergrund entfernen)</label>
+        <p class="hint">Weißes Papier wird durchsichtig, Linien und Beschriftungen bleiben – auch farbige. So liegen die Ebenen sauber übereinander und in der 3D-Ansicht sieht man durch. Plankopf und Legende schneidest du danach mit „Zuschneiden“ weg.</p>
+        <label class="chk" id="fdRepRow"><input type="checkbox" id="fdRep" checked> Vorhandenen Grundriss dieser Ebene ersetzen</label>
+        <div class="errbox" hidden id="fdErr"></div>
+      </div>
+      <footer><button class="btn" data-x>Abbrechen</button><button class="btn pri" id="fdGo">Übernehmen</button></footer>`);
+    const q = (x) => m.el.querySelector(x);
+    const srcMode = () => (m.el.querySelector('input[name=fdS]:checked') || {}).value || 'file';
+    const upd = () => {
+      const pdf = srcMode() === 'pdf' || isPdfFile(chosen);
+      q('#fdPageRow').hidden = !pdf;
+      if (srcMode() === 'pdf' && q('#fdPdf')) { const a = assets.get(q('#fdPdf').value); q('#fdPage').max = a?.meta?.pages || 1; }
+      const has = S.floors.some(f => f.lv === q('#fdLv').value);
+      q('#fdRepRow').hidden = !has;
+    };
+    m.el.addEventListener('change', (e) => {
+      if (e.target.id === 'fdFile') { chosen = e.target.files[0] || null; q('#fdFileName').textContent = ''; const r = m.el.querySelector('input[value=file]'); if (r) r.checked = true; }
+      upd();
+    });
+    upd();
+    q('#fdGo').onclick = async () => {
+      const mode2 = srcMode(); const err = q('#fdErr'); err.hidden = true;
+      if (mode2 === 'file' && !chosen) { err.textContent = 'Wähle eine Datei aus.'; err.hidden = false; return; }
+      const btn = q('#fdGo'); btn.disabled = true; btn.textContent = 'Wird umgewandelt …';
+      try {
+        await importFloor({ file: mode2 === 'file' ? chosen : null, srcPdf: mode2 === 'pdf' ? q('#fdPdf').value : null, page: Math.max(1, Math.floor(+q('#fdPage').value || 1)),
+          transparent: q('#fdTr').checked, lv: q('#fdLv').value, replace: !q('#fdRepRow').hidden && q('#fdRep').checked ? (replaceFloor || S.floors.find(f => f.lv === q('#fdLv').value)?.id) : null });
+        m.close();
+      } catch (e) { err.textContent = e.message || 'Der Grundriss konnte nicht geladen werden.'; err.hidden = false; btn.disabled = false; btn.textContent = 'Übernehmen'; }
+    };
   }
+  async function importFloor({ file, srcPdf, page = 1, transparent = true, lv = curLv, replace = null }) {
+    let res, name;
+    if (srcPdf) { res = await api.post(`/api/plans/${planId}/assets/${srcPdf}/render`, { page, transparent }); name = (assets.get(srcPdf)?.filename || 'PDF').replace(/\.pdf$/i, ''); }
+    else if (isPdfFile(file)) {
+      if (config && config.pdfServer) res = await api.upload(`/api/plans/${planId}/assets`, file, 'application/pdf', file.name, { page, transparent });
+      else { const r = await pdfToPngBrowser(file, page, transparent); res = await api.upload(`/api/plans/${planId}/assets`, r.blob, 'image/png', file.name.replace(/\.pdf$/i, '.png'), { ptPerPx: r.ptPerPx, page, pages: r.pages, transparent }); }
+      name = file.name.replace(/\.pdf$/i, '');
+    } else {
+      const blob = transparent && !/svg/.test(file.type) ? await whiteToAlphaBlob(file) : file;
+      res = await api.upload(`/api/plans/${planId}/assets`, blob, transparent && !/svg/.test(file.type) ? 'image/png' : (file.type || 'image/png'), file.name, { transparent });
+      name = file.name.replace(/\.[^.]+$/, '');
+    }
+    assets.set(res.id, { ...res, kind: 'floor' });
+    if (res.meta && res.meta.src && !assets.has(res.meta.src)) assets.set(res.meta.src, { id: res.meta.src, kind: 'pdfsrc', filename: file ? file.name : name + '.pdf', meta: { pages: res.meta.pages } });
+    if (res.meta && res.meta.pages > 1 && !srcPdf && page === 1) setTimeout(() => toast(`Das PDF hat ${res.meta.pages} Seiten. Weitere Seiten weist du anderen Ebenen über „Grundriss zuweisen → aus einem schon geladenen PDF“ zu.`, 7000), 800);
+    placeFloor(res, { lv, replace, name: name + (res.meta && res.meta.pages > 1 ? ` S. ${res.meta.page}` : '') });
+  }
+  // Maßstab (Welt-Einheiten pro PDF-Punkt) eines kalibrierten PDF-Grundrisses
+  function worldPerPt(f) { const a = assets.get(f.asset); if (!f.pdf || !f.pdf.ptPerPx || !a || !f.calibrated) return null; return (f.w / cropOf(f).w) / f.pdf.ptPerPx; }
+  function placeFloor(res, { lv, replace, name }) {
+    pushUndo();
+    const old = replace ? floorById(replace) : null;
+    const f = { id: uid(), lv, asset: res.id, src: res.meta?.src || null, page: res.meta?.page || null, name, x: 0, y: 0, w: 0, h: 0, w0: res.w, opacity: 0.9, visible: true, invert: true,
+      calibrated: false, locked: true, transparent: !!res.meta?.transparent, pdf: res.meta && res.meta.ptPerPx ? { ptPerPx: res.meta.ptPerPx } : null };
+    // Lage und Maßstab: vom ersetzten Grundriss oder von einem kalibrierten PDF einer anderen Ebene übernehmen
+    const ref = (old && worldPerPt(old) ? old : null) || S.floors.filter(o => o !== old && worldPerPt(o)).sort((a, b) => (a.lv === lv) - (b.lv === lv))[0] || null;
+    let how = '';
+    if (f.pdf && ref) {
+      const wpp = worldPerPt(ref), refPx = (ref.w / cropOf(ref).w), rc = cropOf(ref);
+      f.w = res.w * f.pdf.ptPerPx * wpp; f.h = res.h * f.pdf.ptPerPx * wpp;
+      f.x = ref.x - rc.x * refPx; f.y = ref.y - rc.y * refPx; f.calibrated = true; f.pdfScale = ref.pdfScale;
+      how = `Maßstab und Lage von „${lvById(ref.lv).name}“ übernommen.`;
+    } else if (old) {
+      const k = old.w / cropOf(old).w; f.w = res.w * k; f.h = res.h * k; const oc = cropOf(old); f.x = old.x - oc.x * k; f.y = old.y - oc.y * k; f.calibrated = old.calibrated;
+      how = 'An der Stelle des alten Grundrisses eingesetzt.';
+    } else {
+      const other = S.floors.find(o => o.lv !== lv);
+      const k = other ? other.w / cropOf(other).w : 1600 / Math.max(res.w, res.h);
+      f.w = res.w * k; f.h = res.h * k;
+      const sameLv = S.floors.filter(o => o.lv === lv);
+      if (other) { const oc = cropOf(other); f.x = other.x - oc.x * k; f.y = other.y - oc.y * k; how = 'Über den Grundriss der anderen Ebene gelegt – zum Ausrichten „Verschieben“ nutzen.'; }
+      else if (sameLv.length) { const b = contentBounds(true, lv); f.x = snapV(b.x + b.w + 2 * U); f.y = snapV(b.y); }
+    }
+    if (old) S.floors = S.floors.filter(o => o !== old);
+    S.floors.push(f);
+    if (lv !== curLv) switchLevel(lv, true);
+    changed(); fit(f); tab = 'plan'; renderPane();
+    if (f.calibrated) toast(how + ' Die Kabellängen stimmen damit.', 5500);
+    else if (f.pdf) toast((how ? how + ' ' : '') + 'Gib im Plan-Tab den Zeichnungsmaßstab ein (z. B. 1:100) oder setze den Maßstab mit zwei Punkten.', 7000);
+    else { setMode('calib'); calib = { floor: f.id }; toast((how ? how + ' ' : '') + 'Klicke jetzt zwei Punkte mit bekanntem Abstand.', 6000); }
+  }
+  async function clearFloorBg(id) {
+    const f = floorById(id); if (!f) return;
+    toast('Weißer Hintergrund wird entfernt …', 8000);
+    try {
+      const blob = await whiteToAlphaBlob(assetUrl(f.asset));
+      const res = await api.upload(`/api/plans/${planId}/assets`, blob, 'image/png', (f.name || 'grundriss') + '.png', f.pdf ? { ptPerPx: f.pdf.ptPerPx * (assets.get(f.asset).w / 1) / (await imgW(blob)), transparent: true } : { transparent: true });
+      const oldA = assets.get(f.asset), k = res.w / oldA.w;
+      assets.set(res.id, { ...res, kind: 'floor' });
+      pushUndo(); f.asset = res.id; f.transparent = true; if (f.crop) f.crop = { x: f.crop.x * k, y: f.crop.y * k, w: f.crop.w * k, h: f.crop.h * k };
+      if (f.pdf) f.pdf = { ptPerPx: f.pdf.ptPerPx / k };
+      changed(); toast('Fertig – nur noch die Zeichnung ist sichtbar.');
+    } catch (e) { toast(e.message || 'Das hat nicht geklappt.', 5000, 'bad'); }
+  }
+  const imgW = (blob) => new Promise((res) => { const u = URL.createObjectURL(blob); const i = new Image(); i.onload = () => { res(i.naturalWidth || 1); URL.revokeObjectURL(u); }; i.src = u; });
+  function applyCrop(f, b) {
+    const c0 = cropOf(f), k = f.w / c0.w;
+    const x1 = Math.max(f.x, b.x), y1 = Math.max(f.y, b.y), x2 = Math.min(f.x + f.w, b.x + b.w), y2 = Math.min(f.y + f.h, b.y + b.h);
+    if (x2 - x1 < 20 || y2 - y1 < 20) { toast('Der Rahmen ist zu klein oder liegt neben dem Grundriss.'); return; }
+    pushUndo();
+    f.crop = { x: c0.x + (x1 - f.x) / k, y: c0.y + (y1 - f.y) / k, w: (x2 - x1) / k, h: (y2 - y1) / k };
+    f.x = x1; f.y = y1; f.w = x2 - x1; f.h = y2 - y1;
+    setMode('select'); changed(); toast('Zugeschnitten. „Zuschnitt aufheben“ im Plan-Tab holt den Rest zurück.');
+  }
+  function uncrop(f) {
+    const a = assets.get(f.asset); if (!a || !f.crop) return;
+    const c0 = f.crop, k = f.w / c0.w; pushUndo();
+    f.x -= c0.x * k; f.y -= c0.y * k; f.w = a.w * k; f.h = a.h * k; delete f.crop; changed();
+  }
+
+  /* Ebenen */
+  function switchLevel(id, quiet) {
+    if (!S.levels.some(l => l.id === id) || id === curLv) return;
+    curLv = id; try { localStorage.setItem(LVKEY, id); } catch { /* egal */ }
+    sel = { ids: new Set(), cable: null }; routeCache.clear();
+    if (mode === 'crop' || mode === 'calib') setMode('select');
+    render(); renderPane();
+    if (!quiet) { const b = contentBounds(); if (b) fit(b); }
+  }
+  function addLevel() {
+    if (readonly) return;
+    const names = S.levels.map(l => l.name);
+    const sug = ['UG', 'EG', 'OG', 'Empore', '1. OG', '2. OG', 'Dach'].find(n => !names.includes(n)) || `Ebene ${S.levels.length + 1}`;
+    const elev = sug === 'UG' ? Math.min(...S.levels.map(l => l.elev)) - 3 : Math.max(...S.levels.map(l => l.elev)) + 3.5;
+    pushUndo();
+    const l = { id: uid(), name: sug, elev: Math.round(elev * 10) / 10 };
+    S.levels.push(l); markDirty(); renamingLv = l.id; freshLv = l.id; switchLevel(l.id, true); changed();
+  }
+  // Höhe einer frisch angelegten Ebene aus ihrem Namen ableiten (Keller/UG nach unten, alles andere nach oben)
+  function elevFromName(l) {
+    const o = S.levels.filter(x => x !== l).map(x => x.elev); if (!o.length) return 0;
+    if (/^(u\d*g|kg|k\d)\b|unter|keller|tief/i.test(l.name)) return Math.round((Math.min(...o) - 3) * 10) / 10;
+    if (/^eg\b|erdgeschoss/i.test(l.name) && !o.includes(0)) return 0;
+    return Math.round((Math.max(...o) + 3.5) * 10) / 10;
+  }
+  function deleteLevel(id, btn) {
+    if (S.levels.length < 2) { toast('Eine Ebene muss bleiben.'); return; }
+    const n = S.items.filter(o => o.lv === id).length + S.shapes.filter(o => o.lv === id).length + S.floors.filter(o => o.lv === id).length;
+    if (n && btn && !armButton(btn, `Mit ${n} Element${n === 1 ? '' : 'en'} löschen?`)) return;
+    pushUndo();
+    const gone = new Set(S.items.filter(o => o.lv === id).map(o => o.id));
+    S.items = S.items.filter(o => o.lv !== id); S.shapes = S.shapes.filter(o => o.lv !== id); S.floors = S.floors.filter(o => o.lv !== id);
+    S.cables = S.cables.filter(c => !gone.has(c.from.item) && !gone.has(c.to.item));
+    S.levels = S.levels.filter(l => l.id !== id);
+    ensureLv(); sel = { ids: new Set(), cable: null }; changed();
+  }
+  function moveToLevel(ids, lv) {
+    if (!S.levels.some(l => l.id === lv)) return;
+    pushUndo(); ids.forEach(id => { const o = itemById(id) || shapeById(id); if (o) o.lv = lv; });
+    routeCache.clear(); changed(); toast(`Nach „${lvById(lv).name}“ verschoben.`);
+  }
+  function renderLvBar() {
+    const el = $('#lvbar', E); if (!el) return;
+    if (el.contains(document.activeElement) && document.activeElement.tagName === 'INPUT') return;
+    el.innerHTML = lvSorted().map(l => {
+      const cnt = S.items.filter(o => o.lv === l.id).length;
+      if (renamingLv === l.id && !readonly) return `<input class="lvname" data-lvname="${l.id}" value="${esc(l.name)}" maxlength="24" aria-label="Name der Ebene">`;
+      return `<button class="lvb${l.id === curLv ? ' on' : ''}" data-lv="${l.id}" role="tab" aria-selected="${l.id === curLv}" title="${esc(l.name)} · ${fmtNum(l.elev, 1).replace(',0', '')} m${readonly ? '' : ' – Doppelklick zum Umbenennen'}">${esc(l.name)}${cnt ? `<span class="lvc">${cnt}</span>` : ''}</button>`;
+    }).join('') + (readonly ? '' : '<button class="lvb add" data-lvadd title="Neue Ebene anlegen" aria-label="Neue Ebene">+</button>') +
+      `<button class="lvb eye${ghosts ? ' on' : ''}" data-lvghost title="Andere Ebenen blass einblenden (zum Ausrichten und für Kabel zwischen Ebenen)" aria-label="Andere Ebenen einblenden">${ghosts ? '◐' : '○'}</button>`;
+    if (renamingLv) { const inp = el.querySelector('[data-lvname]'); if (inp) setTimeout(() => { inp.focus(); inp.select(); }, 10); }
+  }
+  on($('#lvbar', E), 'click', (e) => {
+    const b = e.target.closest('[data-lv]'); if (b) { switchLevel(b.dataset.lv); return; }
+    if (e.target.closest('[data-lvadd]')) { addLevel(); return; }
+    if (e.target.closest('[data-lvghost]')) { ghosts = !ghosts; try { localStorage.setItem('pp.ghosts', ghosts ? '1' : '0'); } catch { /* egal */ } render(); }
+  });
+  on($('#lvbar', E), 'dblclick', (e) => { const b = e.target.closest('[data-lv]'); if (b && !readonly) { renamingLv = b.dataset.lv; renderLvBar(); } });
+  const finishRename = (inp, save) => {
+    const l = S.levels.find(x => x.id === inp.dataset.lvname); renamingLv = null;
+    if (l && save) { const v = inp.value.trim(); if (v && v !== l.name) { if (freshLv !== l.id) pushUndo(); l.name = v; if (freshLv === l.id) l.elev = elevFromName(l); markDirty(); } }
+    freshLv = null;
+    inp.blur(); renderLvBar(); renderPane();
+  };
+  on($('#lvbar', E), 'keydown', (e) => { const inp = e.target.closest('[data-lvname]'); if (!inp) return; if (e.key === 'Enter') finishRename(inp, true); if (e.key === 'Escape') { e.stopPropagation(); finishRename(inp, false); } });
+  on($('#lvbar', E), 'focusout', (e) => { const inp = e.target.closest('[data-lvname]'); if (inp && renamingLv) finishRename(inp, true); });
   function removeFloor(id) { pushUndo(); S.floors = S.floors.filter(f => f.id !== id); sel.floor = null; changed(); }
 
   /* ---------- Zeiger ---------- */
@@ -685,6 +919,7 @@ export async function openEditor(root, opts) {
       if (it || sh) { sel = { ids: new Set([(it || sh).dataset.item || (it || sh).dataset.shape]), cable: null }; tab = 'sel'; renderPane(); render(); return; }
       drag = { kind: 'pan', sx: e.clientX, sy: e.clientY, vx: view.x, vy: view.y }; render(); return;
     }
+    if (mode === 'crop') { drag = { kind: 'cropbox', p0: w, cur: w }; return; }
     if (drawTool) {
       const p = snapP(w);
       if (['sym', 'text'].includes(drawTool.split(':')[0])) { placeAt(p, e.altKey); return; }
@@ -703,7 +938,8 @@ export async function openEditor(root, opts) {
     if (wp && sel.cable) { pushUndo(); drag = { kind: 'wp', i: +wp.dataset.wp, c: sel.cable }; return; }
     const cab = e.target.closest('[data-cable]');
     if (cab) { sel = { ids: new Set(), cable: cab.dataset.cable }; tab = 'sel'; render(); renderPane(); return; }
-    const el = e.target.closest('[data-item]') || e.target.closest('[data-shape]');
+    const el0 = e.target.closest('[data-item]') || e.target.closest('[data-shape]');
+    const el = el0 && el0.dataset.ghost ? null : el0;
     if (el) {
       const id = el.dataset.item || el.dataset.shape;
       if (e.shiftKey || e.metaKey || e.ctrlKey) { sel.ids.has(id) ? sel.ids.delete(id) : sel.ids.add(id); }
@@ -712,8 +948,8 @@ export async function openEditor(root, opts) {
       const start = {}; for (const sid of sel.ids) { const o = itemById(sid) || shapeById(sid); if (o) start[sid] = { x: o.x, y: o.y }; }
       // Zone verschiebt ihren Inhalt mit
       const zone = shapeById(id); if (zone && zone.kind === 'zone' && sel.ids.size === 1 && !e.altKey) {
-        S.items.forEach(it => { const c = center(it); if (c.x >= zone.x && c.x <= zone.x + zone.w && c.y >= zone.y && c.y <= zone.y + zone.h) start[it.id] = { x: it.x, y: it.y }; });
-        S.shapes.forEach(s => { if (s.id !== zone.id && s.kind !== 'zone' && s.x >= zone.x && s.x <= zone.x + zone.w && s.y >= zone.y && s.y <= zone.y + zone.h) start[s.id] = { x: s.x, y: s.y }; });
+        S.items.forEach(it => { const c = center(it); if (it.lv === zone.lv && c.x >= zone.x && c.x <= zone.x + zone.w && c.y >= zone.y && c.y <= zone.y + zone.h) start[it.id] = { x: it.x, y: it.y }; });
+        S.shapes.forEach(s => { if (s.id !== zone.id && s.lv === zone.lv && s.kind !== 'zone' && s.x >= zone.x && s.x <= zone.x + zone.w && s.y >= zone.y && s.y <= zone.y + zone.h) start[s.id] = { x: s.x, y: s.y }; });
       }
       const wps = {}; S.cables.forEach(c => { if (start[c.from.item] && start[c.to.item] && c.wps.length) wps[c.id] = c.wps.map(p => ({ ...p })); });
       drag = { kind: 'move', p0: w, start, wps, moved: false }; render(); renderPane(); return;
@@ -745,7 +981,7 @@ export async function openEditor(root, opts) {
       case 'floor': { const f = floorById(drag.id); f.x = snapV(drag.x0 + w.x - drag.p0.x); f.y = snapV(drag.y0 + w.y - drag.p0.y); drag.moved = true; render(); break; }
       case 'wp': { const c = cableById(drag.c); if (c) { c.wps[drag.i] = snapP(w); render(); } break; }
       case 'link': drag.cur = w; render(); break;
-      case 'box': drag.cur = w; render(); break;
+      case 'box': case 'cropbox': drag.cur = w; render(); break;
       case 'draw': drag.cur = snapP(w); drag.preview = makeShape(drawTool, drag.p0, drag.cur, e.shiftKey); render(); break;
       case 'handle': {
         const s = shapeById(drag.id); if (!s) return; drag.moved = true;
@@ -766,7 +1002,7 @@ export async function openEditor(root, opts) {
   function nearestPort(w, exceptItem) {
     let best = null, bd = 22 / view.z;
     for (const it of S.items) {
-      if (it.id === exceptItem) continue;
+      if (it.id === exceptItem || !(onLv(it) || shownGhosts.has(it.id))) continue;
       const g = lay(it);
       for (const t of g.tabs) {
         // Abstand zum Tab-Rechteck (0, wenn der Zeiger darauf liegt)
@@ -790,10 +1026,11 @@ export async function openEditor(root, opts) {
     }
     if (d.kind === 'box') {
       const b = normBox(d.p0, d.cur);
-      S.items.forEach(it => { const ib = itemBox(it); if (ib.x >= b.x && ib.y >= b.y && ib.x + ib.w <= b.x + b.w && ib.y + ib.h <= b.y + b.h) sel.ids.add(it.id); });
-      S.shapes.forEach(s => { const sb = shapeBox(s); if (sb.x >= b.x && sb.y >= b.y && sb.x + sb.w <= b.x + b.w && sb.y + sb.h <= b.y + b.h) sel.ids.add(s.id); });
+      S.items.filter(onLv).forEach(it => { const ib = itemBox(it); if (ib.x >= b.x && ib.y >= b.y && ib.x + ib.w <= b.x + b.w && ib.y + ib.h <= b.y + b.h) sel.ids.add(it.id); });
+      S.shapes.filter(onLv).forEach(s => { const sb = shapeBox(s); if (sb.x >= b.x && sb.y >= b.y && sb.x + sb.w <= b.x + b.w && sb.y + sb.h <= b.y + b.h) sel.ids.add(s.id); });
       render(); renderPane(); return;
     }
+    if (d.kind === 'cropbox') { const f = floorById(cropFloor); if (f && d.cur) applyCrop(f, normBox(d.p0, d.cur)); else render(); return; }
     if (d.kind === 'draw') {
       const small = dist(d.p0, d.cur || d.p0) * view.z < 6;
       const s = small ? makeShape(drawTool, d.p0, null) : makeShape(drawTool, d.p0, d.cur, e.shiftKey);
@@ -820,6 +1057,7 @@ export async function openEditor(root, opts) {
     const cab = e.target.closest('[data-cable]');
     if (cab) { addPin(cab.dataset.cable, toWorld(e)); return; }
     const it = e.target.closest('[data-item]');
+    if (it && it.dataset.ghost) { const g = itemById(it.dataset.item); switchLevel(g.lv, true); sel = { ids: new Set([g.id]), cable: null }; tab = 'sel'; render(); renderPane(); return; }
     if (it) { editItemPorts(it.dataset.item); return; }
     const sh = e.target.closest('[data-shape]');
     if (sh) { const s = shapeById(sh.dataset.shape); if (s) { sel = { ids: new Set([s.id]), cable: null }; tab = 'sel'; renderPane(); setTimeout(() => { const f = $('#shText', E) || $('#shLabel', E); f && f.focus(); }, 30); } }
@@ -838,14 +1076,14 @@ export async function openEditor(root, opts) {
     const raw = e.dataTransfer.getData('application/x-pp-gear');
     if (raw) { try { addGear(JSON.parse(raw), toWorld(e)); } catch { /* egal */ } return; }
     const f = e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f && (/^image\//.test(f.type) || /\.pdf$/i.test(f.name))) uploadFloor(f);
+    if (f && (/^image\//.test(f.type) || /\.pdf$/i.test(f.name))) openFloorDialog({ file: f });
   });
 
   /* ---------- Zeichenwerkzeuge ---------- */
   const drawLabel = (t) => { const [k, s] = t.split(':'); return k === 'sym' ? SYMS[s].n : SHAPES[k]; };
   function makeShape(tool, p0, p1, shift) {
     const [k, sym] = tool.split(':');
-    const base = { id: uid(), kind: k, color: 'gray', fill: 'tint', weight: 2, label: '', rot: 0 };
+    const base = { id: uid(), kind: k, lv: curLv, color: 'gray', fill: 'tint', weight: 2, label: '', rot: 0 };
     if (k === 'sym') return { ...base, sym, x: p0.x - 0.6 * U, y: p0.y - 0.6 * U, w: 1.2 * U, h: 1.2 * U, color: sym === 'power' ? 'red' : sym === 'camera' ? 'blue' : sym === 'light' ? 'yellow' : 'gray' };
     if (k === 'text') return { ...base, fill: 'none', x: p0.x, y: p0.y, text: 'Text', size: 18, bold: false };
     if (k === 'line' || k === 'arrow') { const q = p1 || { x: p0.x + 3 * U, y: p0.y }; let w = q.x - p0.x, h = q.y - p0.y; if (shift) { if (Math.abs(w) > Math.abs(h)) h = 0; else w = 0; } return { ...base, fill: 'none', x: p0.x, y: p0.y, w, h, color: k === 'arrow' ? 'orange' : 'gray' }; }
@@ -874,7 +1112,7 @@ export async function openEditor(root, opts) {
   function toggleDtb(force) { const d = $('#dtb', E); d.hidden = force != null ? !force : !d.hidden; $('#bDraw', E)?.classList.toggle('on', !d.hidden); if (d.hidden) drawTool = null; renderDtb(); render(); try { localStorage.setItem('pp.dtb', d.hidden ? '0' : '1'); } catch { /* egal */ } }
 
   function setMode(m, keepTool) {
-    mode = m; if (!keepTool) drawTool = null; calib = m === 'calib' ? { floor: calib?.floor } : null; measure = null;
+    mode = m; if (!keepTool) drawTool = null; calib = m === 'calib' ? { floor: calib?.floor } : null; measure = null; if (m !== 'crop') cropFloor = null;
     $$('[data-mode]', E).forEach(b => b.classList.toggle('on', b.dataset.mode === m)); renderDtb(); render();
   }
   $$('[data-mode]', E).forEach(b => on(b, 'click', () => setMode(b.dataset.mode)));
@@ -899,6 +1137,7 @@ export async function openEditor(root, opts) {
       const item = itemById(id);
       h = `<button data-c="edit">Ports bearbeiten …</button><button data-c="dup">Duplizieren <kbd>Strg D</kbd></button><button data-c="copy">Kopieren <kbd>Strg C</kbd></button>
         <button data-c="savegear">In meinen Geräten speichern</button>${item.gear ? '<button data-c="syncgear">Aus Bibliothek aktualisieren</button>' : ''}
+        ${S.levels.length > 1 ? `<div class="ctx-sub">Auf Ebene</div>${lvSorted().filter(l => l.id !== item.lv).map(l => `<button data-tolv="${l.id}">→ ${esc(l.name)}</button>`).join('')}` : ''}
         <hr><button data-c="front">Nach vorne</button><button data-c="back">Nach hinten</button><hr><button data-c="del">Löschen <kbd>Entf</kbd></button>`;
     } else if (sh) {
       const id = sh.dataset.shape; if (!sel.ids.has(id)) sel = { ids: new Set([id]), cable: null }; const s = shapeById(id);
@@ -908,10 +1147,10 @@ export async function openEditor(root, opts) {
         `<hr><button data-c="label">${s.kind === 'text' ? 'Text bearbeiten' : 'Beschriften'}</button>${s.kind === 'zone' ? '<button data-c="zoomzone">Auf Zone zoomen</button>' : ''}<button data-c="dup">Duplizieren <kbd>Strg D</kbd></button><button data-c="front">Nach vorne</button><button data-c="back">Nach hinten</button><hr><button data-c="del">Löschen <kbd>Entf</kbd></button>`;
     } else if (fl) {
       const f = floorById(fl.dataset.floor); sel = { ids: new Set(), cable: null, floor: f.id };
-      h = `<button data-c="floorlock">${f.locked === false ? 'Grundriss fixieren' : 'Grundriss verschieben'}</button><button data-c="calibfloor">Maßstab setzen</button><button data-c="floorback">Nach hinten</button><hr><button data-c="floordel">Grundriss entfernen</button>`;
+      h = `<button data-c="floorlock">${f.locked === false ? 'Grundriss fixieren' : 'Grundriss verschieben'}</button><button data-c="calibfloor">Maßstab setzen</button><button data-c="floorcrop">Zuschneiden</button>${f.transparent ? '' : '<button data-c="floorclear">Weißen Hintergrund entfernen</button>'}<button data-c="floorback">Nach hinten</button><hr><button data-c="floordel">Grundriss entfernen</button>`;
       ctxEl._floor = f.id;
     } else {
-      h = `<button data-c="center">Hier zentrieren</button><button data-c="fit">Alles einpassen <kbd>F</kbd></button><button data-c="paste">Einfügen <kbd>Strg V</kbd></button><button data-c="toolbar">Zeichenwerkzeuge <kbd>Shift D</kbd></button><button data-c="addfloor">Grundriss laden …</button>`;
+      h = `<button data-c="center">Hier zentrieren</button><button data-c="fit">Alles einpassen <kbd>F</kbd></button><button data-c="paste">Einfügen <kbd>Strg V</kbd></button><button data-c="toolbar">Zeichenwerkzeuge <kbd>Shift D</kbd></button><button data-c="addfloor">Grundriss für „${esc(lvById(curLv).name)}“ laden …</button>`;
     }
     ctxEl._at = w;
     render(); renderPane();
@@ -929,6 +1168,7 @@ export async function openEditor(root, opts) {
     if (b.dataset.fill) { pushUndo(); shapesSel().forEach(o => { o.fill = b.dataset.fill; }); changed(); hideCtx(); return; }
     if (b.dataset.wt) { pushUndo(); shapesSel().forEach(o => { o.weight = +b.dataset.wt; }); changed(); hideCtx(); return; }
     if (b.dataset.route) { pushUndo(); const c = cableById(sel.cable); c.route = b.dataset.route; c.wps = []; changed(); hideCtx(); return; }
+    if (b.dataset.tolv) { hideCtx(); moveToLevel([...sel.ids], b.dataset.tolv); return; }
     const c = b.dataset.c; hideCtx();
     const map = {
       pin: () => addPin(ctxEl._pin.cid, ctxEl._pin.w),
@@ -938,7 +1178,8 @@ export async function openEditor(root, opts) {
       front: () => act('front'), back: () => act('back'),
       label: () => { tab = 'sel'; renderPane(); setTimeout(() => { const f = $('#shText', E) || $('#shLabel', E); f && f.focus(); }, 30); },
       zoomzone: () => { const zz = shapeById(one); fit({ x: zz.x, y: zz.y - 30, w: zz.w, h: zz.h + 30 }); },
-      fit: () => fit(), toolbar: () => toggleDtb(), addfloor: () => $('#fFloor', E).click(),
+      fit: () => fit(), toolbar: () => toggleDtb(), addfloor: () => openFloorDialog(),
+      floorcrop: () => floorAction('crop', ctxEl._floor), floorclear: () => clearFloorBg(ctxEl._floor),
       center: () => { const r = svg.getBoundingClientRect(); view.x = r.width / 2 - ctxEl._at.x * view.z; view.y = r.height / 2 - ctxEl._at.y * view.z; render(); },
       floorlock: () => { pushUndo(); const f = floorById(ctxEl._floor); f.locked = f.locked === false; changed(); toast(f.locked ? 'Grundriss fixiert.' : 'Grundriss lässt sich jetzt verschieben.'); },
       calibfloor: () => { setMode('calib'); calib = { floor: ctxEl._floor }; render(); },
@@ -959,6 +1200,7 @@ export async function openEditor(root, opts) {
     if ((k === '+' || k === '=') && !mod) { setZoom(view.z * 1.25); return; }
     if (k === '-' && !mod) { setZoom(view.z / 1.25); return; }
     if (k === 'm' && !mod) { setMode('measure'); return; }
+    if (e.key === 'PageUp' || e.key === 'PageDown') { e.preventDefault(); const L = lvSorted(); const i = L.findIndex(l => l.id === curLv); const n = L[i + (e.key === 'PageUp' ? -1 : 1)]; if (n) switchLevel(n.id); return; }
     if (e.key === 'Escape') { hideCtx(); if (drawTool || mode !== 'select') setMode('select'); else { sel = { ids: new Set(), cable: null }; render(); renderPane(); } return; }
     if (readonly) return;
     if (mod && k === 'z') { e.preventDefault(); e.shiftKey ? doRedo() : doUndo(); return; }
@@ -967,7 +1209,7 @@ export async function openEditor(root, opts) {
     if (mod && k === 'c') { copySelection(); return; }
     if (mod && k === 'v') { e.preventDefault(); pasteClip(); return; }
     if (mod && k === 's') { e.preventDefault(); scheduleSave.flush(); return; }
-    if (mod && k === 'a') { e.preventDefault(); sel = { ids: new Set([...S.items.map(i => i.id), ...S.shapes.map(s => s.id)]), cable: null }; render(); renderPane(); return; }
+    if (mod && k === 'a') { e.preventDefault(); sel = { ids: new Set([...S.items.filter(onLv).map(i => i.id), ...S.shapes.filter(onLv).map(s => s.id)]), cable: null }; render(); renderPane(); return; }
     if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelection(); return; }
     if (e.shiftKey && k === 'd') { toggleDtb(); return; }
     if (mod) return;
@@ -1108,8 +1350,9 @@ export async function openEditor(root, opts) {
       if (c) { const other = c.from.item === it.id ? c.to : c.from; const oi = itemById(other.item); peer = `${esc(itemName(oi))} · ${esc(portOf(oi, other.port).name)}`; }
       return `<div ${c ? `data-selc="${c.id}" class="link"` : ''}><span class="dot" style="background:${typeOf(p.type).color}"></span><span class="dir">${p.dir === 'io' ? 'I/O' : p.dir === 'in' ? 'IN' : 'OUT'}</span><span>${esc(p.name)}${c ? `<br><span class="muted small">${p.dir === 'in' ? '← ' : p.dir === 'out' ? '→ ' : '⇄ '}${peer}</span>` : ''}</span><span class="muted small">${c ? esc(ids[c.id]) : 'frei'}</span></div>`;
     }).join('');
-    const z = zoneOf(center(it));
+    const z = zoneOf(center(it), it.lv);
     return `<div class="sec"><h3>Gerät ${z ? `<span class="chip">${esc(z.label || 'Zone')}</span>` : ''}</h3>
+      ${S.levels.length > 1 ? `<label class="row"><span>Ebene</span><select class="inp" id="iLv">${lvSorted().map(l => `<option value="${l.id}"${l.id === it.lv ? ' selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>` : ''}
       ${field('iLabel', 'Bezeichnung', it.label, 'text', 'placeholder="z. B. CAM 1" maxlength="60"')}
       ${field('iName', 'Gerät', it.name, 'text', 'maxlength="120"')}
       ${field('iInv', 'Geräte-ID', it.inv, 'text', 'placeholder="Inventar-Nr., optional" maxlength="60"')}
@@ -1126,6 +1369,7 @@ export async function openEditor(root, opts) {
       ${s.kind === 'text' ? `<label class="fld"><span>Text <em># Überschrift · - Liste · **fett**</em></span><textarea class="inp" id="shText" rows="5">${esc(s.text)}</textarea></label>
         <label class="row"><span>Größe</span><input type="range" id="shSize" min="10" max="72" value="${s.size || 18}"></label><label class="chk"><input type="checkbox" id="shBold"${s.bold ? ' checked' : ''}> Alles fett</label>`
       : field('shLabel', s.kind === 'zone' ? 'Name' : 'Beschriftung', s.label || '', 'text', s.kind === 'zone' ? 'placeholder="z. B. Bühne"' : 'placeholder="z. B. Tisch 4"')}
+      ${S.levels.length > 1 ? `<label class="row"><span>Ebene</span><select class="inp" id="shLv">${lvSorted().map(l => `<option value="${l.id}"${l.id === s.lv ? ' selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>` : ''}
       <div class="row"><span>Farbe</span>${sw}</div>
       ${s.kind !== 'line' && s.kind !== 'arrow' ? `<div class="row"><span>${s.kind === 'text' ? 'Hintergrund' : 'Füllung'}</span><div class="seg">${[['none', 'Keine'], ['tint', 'Getönt'], ['solid', 'Voll']].map(([k, n]) => `<button data-sfill="${k}" class="${s.fill === k ? 'on' : ''}">${n}</button>`).join('')}</div></div>` : ''}
       ${s.kind !== 'text' ? `<div class="row"><span>Linie</span><div class="seg">${[[1, 'Dünn'], [2, 'Normal'], [3, 'Fett']].map(([k, n]) => `<button data-swt="${k}" class="${(s.weight || 2) == k ? 'on' : ''}">${n}</button>`).join('')}</div></div>` : ''}
@@ -1136,14 +1380,15 @@ export async function openEditor(root, opts) {
   }
   function paneFloorSel(f) {
     return `<div class="sec"><h3>Grundriss</h3><p class="hint"><b>${esc(f.name)}</b>${f.locked === false ? ' lässt sich verschieben. Fixiere ihn, wenn er sitzt.' : ''}</p>
-      <div class="btnrow"><button class="btn" data-fa="lock" data-f="${f.id}">${f.locked === false ? 'Fixieren' : 'Verschieben'}</button><button class="btn" data-fa="calib" data-f="${f.id}">Maßstab setzen</button><button class="btn bad" data-fa="del" data-f="${f.id}">Entfernen</button></div></div>`;
+      <div class="btnrow"><button class="btn" data-fa="lock" data-f="${f.id}">${f.locked === false ? 'Fixieren' : 'Verschieben'}</button><button class="btn" data-fa="calib" data-f="${f.id}">Maßstab setzen</button><button class="btn" data-fa="crop" data-f="${f.id}">Zuschneiden</button><button class="btn bad" data-fa="del" data-f="${f.id}">Entfernen</button></div></div>`;
   }
   function paneCable(c) {
     const r = calc(c), ids = cableIds(), a = itemById(c.from.item), b = itemById(c.to.item), pa = portOf(a, c.from.port), pb = portOf(b, c.to.port), s = S.settings, ad = adaptersOf(c);
     const route = c.wps.length ? 'pins' : (c.route || s.route);
     const uncal = S.floors.length && !S.floors.some(f => f.calibrated);
     return `<div class="sec"><h3>Kabel <span class="chip"><span class="dot" style="background:${typeOf(c.type).color}"></span>${esc(ids[c.id])}</span></h3>
-      <div class="box small"><div><span class="muted">Von</span> <b>${esc(itemName(a))}</b> · ${esc(pa.name)} <span class="muted">(${DIRS[pa.dir]})</span></div><div><span class="muted">${isBi(c) ? '⇄' : '→'} Nach</span> <b>${esc(itemName(b))}</b> · ${esc(pb.name)} <span class="muted">(${DIRS[pb.dir]})</span></div></div>
+      <div class="box small"><div><span class="muted">Von</span> <b>${esc(itemName(a))}</b> · ${esc(pa.name)} <span class="muted">(${DIRS[pa.dir]}${S.levels.length > 1 ? ' · ' + esc(lvById(a.lv).name) : ''})</span></div><div><span class="muted">${isBi(c) ? '⇄' : '→'} Nach</span> <b>${esc(itemName(b))}</b> · ${esc(pb.name)} <span class="muted">(${DIRS[pb.dir]}${S.levels.length > 1 ? ' · ' + esc(lvById(b.lv).name) : ''})</span></div></div>
+      ${isCross(c) ? `<div class="box small">Kabel zwischen zwei Ebenen. Der Höhenunterschied (${fmtLen(r.lvh || 0, 2)}) wird automatisch addiert. Die Steigleitung liegt am ↕-Punkt.</div>` : ''}
       ${ad.length ? `<div class="warnbox">Adapter nötig: <b>${ad.map(esc).join(', ')}</b>. Er steht automatisch in der Packliste.</div>` : ''}
       <label class="row"><span>Kabeltyp</span><select class="inp" id="cType">${typeOptions(c.type)}</select></label>
       ${field('cLabel', 'Kabel-ID', c.label || '', 'text', `placeholder="${esc(ids[c.id])}" maxlength="40"`)}
@@ -1157,6 +1402,7 @@ export async function openEditor(root, opts) {
         <tr><td>Weg auf dem Plan</td><td>${fmtLen(r.geo, 2)}</td></tr>
         <tr><td>Zuschlag Enden (2 × ${fmtLen(s.endSlack, 1)})</td><td>+ ${fmtLen(r.slack, 2)}</td></tr>
         ${r.height ? `<tr><td>Höhenzuschlag</td><td>+ ${fmtLen(r.height, 2)}</td></tr>` : ''}
+        ${r.lvh ? `<tr><td>Höhenunterschied ${esc(lvById(a.lv).name)} ↕ ${esc(lvById(b.lv).name)}</td><td>+ ${fmtLen(r.lvh, 2)}</td></tr>` : ''}
         ${r.extra ? `<tr><td>Zusatzlänge dieses Kabels</td><td>+ ${fmtLen(r.extra, 2)}</td></tr>` : ''}
         <tr><td>Reserve ${(+s.reserve).toLocaleString('de-DE')} %</td><td>+ ${fmtLen(r.reserve, 2)}</td></tr>
         <tr class="tot"><td>Berechnet</td><td>${fmtLen(r.total, 2)}</td></tr>
@@ -1164,14 +1410,14 @@ export async function openEditor(root, opts) {
         <tr class="pack"><td>In der Packliste</td><td>${fmtLen(r.pack.len)}</td></tr>
       </table>
       <p class="hint small">${r.pack.drum ? 'Länger als das längste Standardkabel – als Trommel/Meterware gerundet.' : r.pack.std ? 'Auf die nächste Standardlänge aufgerundet.' : 'Auf ganze Einheiten aufgerundet.'}${uncal ? ' <b class="warn-t">Der Grundriss ist noch nicht kalibriert – die Länge stimmt erst nach „Maßstab“.</b>' : ''}</p></div>
-      ${field('cExtra', `Zusatzlänge (${uName()})`, c.extra ? +toUser(c.extra).toFixed(2) : '', 'text', 'inputmode="decimal" placeholder="z. B. Steigleitung zwischen Etagen"')}
+      ${field('cExtra', `Zusatzlänge (${uName()})`, c.extra ? +toUser(c.extra).toFixed(2) : '', 'text', 'inputmode="decimal" placeholder="z. B. Umweg durch den Schacht"')}
       ${field('cOverride', `Feste Länge (${uName()})`, c.override > 0 ? +toUser(c.override).toFixed(2) : '', 'text', 'inputmode="decimal" placeholder="leer = berechnen"')}
       ${readonly ? '' : '<button class="btn bad" data-a="del">Kabel löschen</button>'}
     </div>`}`;
   }
   function panePlan() {
     const s = S.settings;
-    const zones = S.shapes.filter(z => z.kind === 'zone');
+    const zones = S.shapes.filter(z => z.kind === 'zone' && onLv(z));
     const canTeam = !readonly && me && (meta.access === 'owner' || (meta.team_id && (opts.teams || []).find(t => t.id === meta.team_id)?.role === 'admin'));
     return `${readonly ? '' : `<div class="sec"><h3>Plandetails</h3>
       ${field('mJob', 'Job-ID', meta.job_id, 'text', 'placeholder="z. B. 2026-118" maxlength="60"')}
@@ -1181,15 +1427,24 @@ export async function openEditor(root, opts) {
       ${canTeam ? `<label class="row"><span>Team</span><select class="inp" id="mTeam"><option value="">Nur ich</option>${(opts.teams || []).map(t => `<option value="${t.id}"${t.id === meta.team_id ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select></label>` : meta.team_name ? `<p class="hint">Team: <b>${esc(meta.team_name)}</b></p>` : ''}
       <label class="chk"><input type="checkbox" id="mTpl"${meta.is_template ? ' checked' : ''}> Als Vorlage verwenden</label>
     </div>`}
-    <div class="sec"><h3>Grundrisse ${readonly ? '' : '<button class="btn sm pri" data-a="addFloor">+ Laden</button>'}</h3>
-      ${S.floors.length ? S.floors.map(f => `<div class="floorrow">
+    <div class="sec"><h3>Ebenen ${readonly ? '' : '<button class="btn sm pri" data-a="addLevel">+ Ebene</button>'}</h3>
+      <div class="lvlist">${lvSorted().map(l => { const fl = S.floors.filter(f => f.lv === l.id); const n = S.items.filter(o => o.lv === l.id).length; return `<div class="lvrow${l.id === curLv ? ' on' : ''}">
+        <div class="inline"><input class="inp sm" data-lvn="${l.id}" value="${esc(l.name)}" maxlength="24" aria-label="Name der Ebene" ${readonly ? 'disabled' : ''}>
+          <span class="inline small muted lvh"><input class="inp sm" data-lve="${l.id}" value="${fmtNum(toUser(l.elev), 2).replace(/,00$/, '')}" inputmode="decimal" aria-label="Höhe der Ebene" style="width:64px" ${readonly ? 'disabled' : ''}>${uName()}</span></div>
+        <div class="small muted">${n} Gerät${n === 1 ? '' : 'e'} · ${fl.length ? `Grundriss: ${esc(fl.map(f => f.name).join(', '))}` : 'kein Grundriss'}</div>
+        <div class="btnrow">${l.id === curLv ? '<span class="chip acc">angezeigt</span>' : `<button class="btn sm" data-lvgo="${l.id}">Anzeigen</button>`}${readonly ? '' : `<button class="btn sm${fl.length ? '' : ' pri'}" data-lvfloor="${l.id}">${fl.length ? 'Grundriss ersetzen' : 'Grundriss zuweisen'}</button>${S.levels.length > 1 ? `<button class="btn sm bad" data-lvdel="${l.id}">Löschen</button>` : ''}`}</div>
+      </div>`; }).join('')}</div>
+      <p class="hint small">Die Höhe ist die Fußbodenhöhe der Ebene (EG = 0). Kabel zwischen Ebenen bekommen den Höhenunterschied automatisch dazu. Ebenen wechselst du oben über der Planfläche oder mit Bild ↑/↓.</p>
+    </div>
+    <div class="sec"><h3>Grundriss – ${esc(lvById(curLv).name)} ${readonly ? '' : '<button class="btn sm" data-a="addFloor">+ Laden</button>'}</h3>
+      ${S.floors.filter(onLv).length ? S.floors.filter(onLv).map(f => `<div class="floorrow">
         <div class="fr-head"><input class="inp sm" data-fname="${f.id}" value="${esc(f.name)}" aria-label="Name des Grundrisses"> ${f.calibrated ? '<span class="chip ok">kalibriert</span>' : '<span class="chip warn">nicht kalibriert</span>'}</div>
-        <div class="small muted">${fmtNum(toUser(f.w / U), 1)} × ${fmtLen(f.h / U, 1)}</div>
-        ${readonly ? '' : `<div class="btnrow"><button class="btn sm pri" data-fa="calib" data-f="${f.id}">Maßstab</button><button class="btn sm" data-fa="lock" data-f="${f.id}">${f.locked === false ? 'Fixieren' : 'Verschieben'}</button><button class="btn sm" data-fa="zoom" data-f="${f.id}">Zeigen</button><button class="btn sm bad" data-fa="del" data-f="${f.id}">Entfernen</button></div>
-        ${f.pdf ? `<label class="row"><span>PDF-Maßstab 1:</span><span class="inline"><input class="inp sm" data-pdfscale="${f.id}" type="number" min="1" placeholder="100"><button class="btn sm" data-fa="pdf" data-f="${f.id}">Anwenden</button></span></label>` : ''}
+        <div class="small muted">${fmtNum(toUser(f.w / U), 1)} × ${fmtLen(f.h / U, 1)}${f.page ? ` · PDF-Seite ${f.page}` : ''}${f.transparent ? ' · nur Zeichnung' : ''}${f.crop ? ' · zugeschnitten' : ''}</div>
+        ${readonly ? '' : `<div class="btnrow"><button class="btn sm pri" data-fa="calib" data-f="${f.id}">Maßstab</button><button class="btn sm" data-fa="lock" data-f="${f.id}">${f.locked === false ? 'Fixieren' : 'Verschieben'}</button><button class="btn sm" data-fa="crop" data-f="${f.id}">Zuschneiden</button>${f.crop ? `<button class="btn sm" data-fa="uncrop" data-f="${f.id}">Zuschnitt aufheben</button>` : ''}${f.transparent ? '' : `<button class="btn sm" data-fa="clear" data-f="${f.id}">Weiß entfernen</button>`}${f.src ? `<button class="btn sm" data-fa="page" data-f="${f.id}">Andere Seite</button>` : ''}<button class="btn sm" data-fa="zoom" data-f="${f.id}">Zeigen</button><button class="btn sm bad" data-fa="del" data-f="${f.id}">Entfernen</button></div>
+        ${f.pdf ? `<label class="row"><span>PDF-Maßstab 1:</span><span class="inline"><input class="inp sm" data-pdfscale="${f.id}" type="number" min="1" placeholder="${f.pdfScale || 100}"><button class="btn sm" data-fa="pdf" data-f="${f.id}">Anwenden</button></span></label>` : ''}
         <label class="row"><span>Deckkraft</span><input type="range" data-fop="${f.id}" min="0.1" max="1" step="0.05" value="${f.opacity ?? 0.9}"></label>
         <div class="chkrow"><label class="chk"><input type="checkbox" data-fvis="${f.id}"${f.visible !== false ? ' checked' : ''}> Anzeigen</label><label class="chk"><input type="checkbox" data-finv="${f.id}"${f.invert ? ' checked' : ''}> Im Dark Mode invertieren</label></div>`}
-      </div>`).join('') : `<p class="hint">Lade Grundrisse als Bild (PNG, JPG, SVG, WebP) oder PDF – auch mehrere, z. B. für jede Etage. Danach zwei Punkte mit bekanntem Abstand anklicken; ab dann rechnet PatchPlaner die Kabelwege in ${units.mode === 'ft' ? 'Fuß' : 'Metern'}.</p>`}
+      </div>`).join('') : `<p class="hint">Diese Ebene hat noch keinen Grundriss. Weise ein PDF (auch eine bestimmte Seite) oder ein Bild zu. Danach den Maßstab setzen – oder er wird von einem kalibrierten PDF einer anderen Ebene übernommen.</p>${readonly ? '' : '<button class="btn pri" data-a="addFloor">Grundriss zuweisen</button>'}`}
     </div>
     <div class="sec"><h3>Kabelberechnung</h3>
       <label class="row"><span>Zuschlag je Ende</span><span class="inline"><input class="inp" id="sSlack" inputmode="decimal" value="${+toUser(s.endSlack).toFixed(2)}"><span class="small muted">${uName()}</span></span></label>
@@ -1207,18 +1462,20 @@ export async function openEditor(root, opts) {
       <label class="chk"><input type="checkbox" id="pHops"${S.hops ? ' checked' : ''}> Sprünge an Kabelkreuzungen</label>
       <label class="chk"><input type="checkbox" id="pStrict"${S.strict ? ' checked' : ''}> Nur gleiche Anschlusstypen verbinden</label>
     </div>
-    ${zones.length ? `<div class="sec"><h3>Zonen</h3><div class="plist">${zones.map(z => `<div class="prow" data-zone="${z.id}"><span class="dot" style="background:${COLORS[z.color] || z.color}"></span><span class="pn">${esc(z.label || 'Zone')}<small>${fmtNum(toUser(z.w / U), 1)} × ${fmtLen(z.h / U, 1)}</small></span><span class="small muted">zoomen</span></div>`).join('')}</div></div>` : ''}`;
+    ${zones.length ? `<div class="sec"><h3>Zonen – ${esc(lvById(curLv).name)}</h3><div class="plist">${zones.map(z => `<div class="prow" data-zone="${z.id}"><span class="dot" style="background:${COLORS[z.color] || z.color}"></span><span class="pn">${esc(z.label || 'Zone')}<small>${fmtNum(toUser(z.w / U), 1)} × ${fmtLen(z.h / U, 1)}</small></span><span class="small muted">zoomen</span></div>`).join('')}</div></div>` : ''}`;
   }
   function packData() {
     const devs = new Map(), ids = cableIds(), cab = new Map(), adapters = new Map(); let total = 0;
-    const zk = (p) => (S.packZones ? (zoneOf(p)?.label || 'Ohne Zone') + '|' : '');
+    const multi = S.levels.length > 1 && S.packLevels;
+    const zk = (p, lv) => { const parts = []; if (multi) parts.push(lvById(lv).name); if (S.packZones) parts.push(zoneOf(p, lv)?.label || 'Ohne Zone'); return parts.length ? parts.join(' · ') + '|' : ''; };
     S.items.forEach(it => {
-      const z = zk(center(it)); const k = 'd|' + z + it.name;
+      const z = zk(center(it), it.lv); const k = 'd|' + z + it.name;
       const d = devs.get(k) || { key: k, zone: z.slice(0, -1), name: it.name, qty: 0, labels: [], color: it.color }; d.qty++; if (it.label || it.inv) d.labels.push([it.label, it.inv].filter(Boolean).join(' / ')); devs.set(k, d);
     });
     S.cables.forEach(c => {
       const r = calc(c); if (!r || r.nocable) return; total += r.pack.len;
-      const mid = r.pts[Math.floor(r.pts.length / 2)]; const z = zk(mid);
+      const mid = r.pts[Math.floor(r.pts.length / 2)]; const ia = itemById(c.from.item), ib = itemById(c.to.item);
+      const z = multi && ia.lv !== ib.lv ? lvSorted().filter(l => l.id === ia.lv || l.id === ib.lv).map(l => l.name).join(' ↕ ') + (S.packZones ? ' · Steigleitung' : '') + '|' : zk(mid, ia.lv);
       const k = 'c|' + z + c.type + '|' + r.pack.len.toFixed(2);
       const d = cab.get(k) || { key: k, zone: z.slice(0, -1), type: c.type, len: r.pack.len, drum: r.pack.drum, qty: 0, ids: [] }; d.qty++; d.ids.push(ids[c.id]); cab.set(k, d);
       adaptersOf(c).forEach(a => { const ak = 'a|' + a; const x = adapters.get(ak) || { key: ak, name: a, qty: 0 }; x.qty++; adapters.set(ak, x); });
@@ -1235,10 +1492,10 @@ export async function openEditor(root, opts) {
     const row = (key, name, sub, q, col) => { const ch = checks[key]; return `<div class="prow${ch ? ' done' : ''}${readonly ? ' ro' : ''}" data-pk="${esc(key)}" role="checkbox" aria-checked="${!!ch}" tabindex="0"><span class="box2">${ch ? '✓' : ''}</span><span class="pn">${col ? `<span class="dot" style="background:${col}"></span> ` : ''}${name}${sub || ch ? `<small>${sub || ''}${ch && ch.by ? `${sub ? ' · ' : ''}gepackt von ${esc(ch.by)}` : ''}</small>` : ''}</span><span class="q">${q}×</span></div>`; };
     const groupBy = (arr, f) => { const g = {}; arr.forEach(x => (g[f(x)] = g[f(x)] || []).push(x)); return g; };
     const devG = groupBy(d.devs, x => x.zone || ''), cabG = groupBy(d.cabs, x => x.zone || '');
-    const zoneHead = (z) => (S.packZones && z ? `<div class="zonehead">${esc(z)}</div>` : '');
+    const zoneHead = (z) => ((S.packZones || (S.levels.length > 1 && S.packLevels)) && z ? `<div class="zonehead">${esc(z)}</div>` : '');
     return `<div class="stats"><div class="stat"><b>${d.devs.reduce((a, b) => a + b.qty, 0)}</b><span>Geräte</span></div><div class="stat"><b>${S.cables.filter(c => !typeOf(c.type).nocable).length}</b><span>Kabel</span></div><div class="stat"><b>${fmtLen(d.total).replace(/ .*/, '')}</b><span>${uName()} Kabel</span></div></div>
       <div class="sec"><h3>Gepackt <span class="chip ${pct === 100 ? 'ok' : ''}">${pct} %</span></h3><div class="progress"><div style="width:${pct}%"></div></div>
-      ${S.shapes.some(s => s.kind === 'zone') ? `<label class="chk"><input type="checkbox" id="pkZones"${S.packZones ? ' checked' : ''}> Nach Zonen gruppieren</label>` : ''}</div>
+      <div class="chkrow">${S.levels.length > 1 ? `<label class="chk"><input type="checkbox" id="pkLevels"${S.packLevels ? ' checked' : ''}> Nach Ebenen gruppieren</label>` : ''}${S.shapes.some(s => s.kind === 'zone') ? `<label class="chk"><input type="checkbox" id="pkZones"${S.packZones ? ' checked' : ''}> Nach Zonen gruppieren</label>` : ''}</div></div>
       <div class="sec"><h3>Geräte</h3>${Object.keys(devG).map(z => zoneHead(z) + `<div class="plist">${devG[z].map(x => row(x.key, esc(x.name), esc(x.labels.join(', ')), x.qty)).join('')}</div>`).join('') || '<p class="hint">Noch keine Geräte im Plan.</p>'}</div>
       <div class="sec"><h3>Kabel <span class="muted small">Längen aus dem Plan</span></h3>${Object.keys(cabG).map(z => zoneHead(z) + `<div class="plist">${cabG[z].map(x => row(x.key, `${esc(typeOf(x.type).name)} ${fmtLen(x.len)}${x.drum ? ' <span class="chip warn">Trommel</span>' : ''}`, esc(x.ids.join(', ')), x.qty, typeOf(x.type).color)).join('')}</div>`).join('') || '<p class="hint">Noch keine Kabel.</p>'}</div>
       ${d.adapters.length ? `<div class="sec"><h3>Adapter und Wandler</h3><div class="plist">${d.adapters.map(x => row(x.key, esc(x.name), '', x.qty)).join('')}</div></div>` : ''}
@@ -1250,15 +1507,16 @@ export async function openEditor(root, opts) {
     const ids = cableIds();
     return S.cables.map(c => {
       const r = calc(c); const a = itemById(c.from.item), b = itemById(c.to.item); if (!r || !a || !b) return null;
-      const za = zoneOf(center(a)), zb = zoneOf(center(b));
+      const za = zoneOf(center(a), a.lv), zb = zoneOf(center(b), b.lv), ml = S.levels.length > 1;
+      const place = (it, z) => [ml ? lvById(it.lv).name : '', z?.label || ''].filter(Boolean).join(' · ');
       return { c, id: ids[c.id], type: typeOf(c.type).name, from: `${itemName(a)} · ${portOf(a, c.from.port).name}`, to: `${itemName(b)} · ${portOf(b, c.to.port).name}`,
-        fromZone: za?.label || '', toZone: zb?.label || '', geo: r.geo, calc: r.total, pack: r.pack.len, nocable: r.nocable, bi: isBi(c), ad: adaptersOf(c).join(', '), notes: c.notes || '' };
+        fromZone: place(a, za), toZone: place(b, zb), geo: r.geo, calc: r.total, pack: r.pack.len, nocable: r.nocable, bi: isBi(c), ad: adaptersOf(c).join(', '), notes: c.notes || '' };
     }).filter(Boolean);
   }
   function panePatch() {
     const rows = patchRows(); const zones = rows.some(r => r.fromZone || r.toZone);
     return `<div class="sec"><h3>Patchliste <span class="muted small">${rows.length} Verbindungen</span></h3>
-      ${rows.length ? `<div class="tscroll"><table class="patch"><thead><tr><th>ID</th><th>Quelle</th><th></th><th>Ziel</th>${zones ? '<th>Zonen</th>' : ''}<th class="num">Weg</th><th class="num">Pack</th></tr></thead><tbody>${rows.map(r => `<tr data-sc="${r.c.id}"><td><span class="dot" style="background:${typeOf(r.c.type).color}"></span> <b>${esc(r.id)}</b></td><td>${esc(r.from)}</td><td>${r.bi ? '⇄' : '→'}</td><td>${esc(r.to)}${r.ad ? `<br><span class="small warn-t">Adapter: ${esc(r.ad)}</span>` : ''}${r.notes ? `<br><span class="small muted">${esc(r.notes)}</span>` : ''}</td>${zones ? `<td class="small">${esc(r.fromZone)}${r.fromZone !== r.toZone ? ' → ' + esc(r.toZone) : ''}</td>` : ''}<td class="num">${fmtLen(r.geo, 1)}</td><td class="num"><b>${r.nocable ? 'Funk' : fmtLen(r.pack)}</b></td></tr>`).join('')}</tbody></table></div>` : '<p class="hint">Noch keine Verbindungen. Ziehe ein Kabel von Port zu Port.</p>'}
+      ${rows.length ? `<div class="tscroll"><table class="patch"><thead><tr><th>ID</th><th>Quelle</th><th></th><th>Ziel</th>${zones ? '<th>Ort</th>' : ''}<th class="num">Weg</th><th class="num">Pack</th></tr></thead><tbody>${rows.map(r => `<tr data-sc="${r.c.id}"><td><span class="dot" style="background:${typeOf(r.c.type).color}"></span> <b>${esc(r.id)}</b></td><td>${esc(r.from)}</td><td>${r.bi ? '⇄' : '→'}</td><td>${esc(r.to)}${r.ad ? `<br><span class="small warn-t">Adapter: ${esc(r.ad)}</span>` : ''}${r.notes ? `<br><span class="small muted">${esc(r.notes)}</span>` : ''}</td>${zones ? `<td class="small">${esc(r.fromZone)}${r.fromZone !== r.toZone ? ' → ' + esc(r.toZone) : ''}</td>` : ''}<td class="num">${fmtLen(r.geo, 1)}</td><td class="num"><b>${r.nocable ? 'Funk' : fmtLen(r.pack)}</b></td></tr>`).join('')}</tbody></table></div>` : '<p class="hint">Noch keine Verbindungen. Ziehe ein Kabel von Port zu Port.</p>'}
       <div class="btnrow"><button class="btn" data-a="csvPatch" data-ro="1">CSV</button><button class="btn" data-a="pdfPatch" data-ro="1">PDF</button></div></div>`;
   }
 
@@ -1275,6 +1533,8 @@ export async function openEditor(root, opts) {
     if (c) { if (id === 'cLabel') set(c, 'label', t.value.trim()); if (id === 'cNotes') set(c, 'notes', t.value); if (id === 'cOverride') set(c, 'override', t.value.trim() ? fromUser(num(t.value)) : null); if (id === 'cExtra') set(c, 'extra', t.value.trim() ? fromUser(num(t.value)) : 0); }
     if (id === 'mJob') setMeta('job_id', t.value); if (id === 'mVenue') setMeta('venue', t.value);
     if (t.dataset.fname) { const f = floorById(t.dataset.fname); set(f, 'name', t.value); }
+    if (t.dataset.lvn) { const l = S.levels.find(x => x.id === t.dataset.lvn); if (l && t.value.trim()) { set(l, 'name', t.value.trim()); renderLvBar(); } }
+    if (t.dataset.lve) { const l = S.levels.find(x => x.id === t.dataset.lve); if (l && t.value.trim() !== '' && t.value.trim() !== '-') set(l, 'elev', fromUser(num(t.value))); }
     if (t.dataset.fop) { const f = floorById(t.dataset.fop); set(f, 'opacity', +t.value); }
     if (id === 'pDs') { editStart(); S.ds = +t.value; clearLayoutCache(); render(); markDirty(); }
     const st = S.settings;
@@ -1296,6 +1556,9 @@ export async function openEditor(root, opts) {
     if (id === 'pHops') { S.hops = t.checked; changed(); }
     if (id === 'pStrict') { S.strict = t.checked; changed(); }
     if (id === 'pkZones') { S.packZones = t.checked; changed(); }
+    if (id === 'pkLevels') { S.packLevels = t.checked; changed(); }
+    if (id === 'iLv') { const it2 = itemById([...sel.ids][0]); if (it2) moveToLevel([it2.id], t.value); }
+    if (id === 'shLv') { const s2 = shapeById([...sel.ids][0]); if (s2) moveToLevel([s2.id], t.value); }
     if (id === 'shBold' && s) { pushUndo(); s.bold = t.checked; changed(); }
     if (['sSlack', 'sHeight', 'sRes', 'cOverride', 'cExtra', 'pDs'].includes(id) || t.dataset.fop) renderPane();
   });
@@ -1314,6 +1577,9 @@ export async function openEditor(root, opts) {
     const b = t.closest('button'); if (!b) return;
     const one = [...sel.ids][0], s = shapeById(one), c = cableById(sel.cable);
     if (b.dataset.fa) { floorAction(b.dataset.fa, b.dataset.f); return; }
+    if (b.dataset.lvgo) { switchLevel(b.dataset.lvgo); return; }
+    if (b.dataset.lvfloor) { openFloorDialog({ lv: b.dataset.lvfloor }); return; }
+    if (b.dataset.lvdel) { deleteLevel(b.dataset.lvdel, b); return; }
     if (readonly && !b.dataset.ro) return;
     if (b.dataset.scol && s) { pushUndo(); s.color = b.dataset.scol; changed(); }
     if (b.dataset.sfill && s) { pushUndo(); s.fill = b.dataset.sfill; changed(); }
@@ -1338,14 +1604,18 @@ export async function openEditor(root, opts) {
     if (a === 'lock') { pushUndo(); f.locked = f.locked === false; changed(); toast(f.locked ? 'Grundriss fixiert.' : 'Ziehe den Grundriss jetzt an die richtige Stelle.'); }
     if (a === 'del') { const btn = pane.querySelector(`[data-fa="del"][data-f="${id}"]`); if (btn && !armButton(btn, 'Wirklich entfernen?')) return; removeFloor(id); }
     if (a === 'pdf') applyPdfScale(id);
+    if (a === 'crop') { setMode('crop'); cropFloor = id; fit(f); render(); }
+    if (a === 'uncrop') uncrop(f);
+    if (a === 'clear') clearFloorBg(id);
+    if (a === 'page') openFloorDialog({ lv: f.lv, srcPdf: f.src, replaceFloor: f.id });
   }
   function applyPdfScale(id) {
     const f = floorById(id); const N = num(pane.querySelector(`[data-pdfscale="${id}"]`)?.value);
     const a = assets.get(f.asset);
     if (!(N > 0) || !f.pdf || !a) { toast('Gib den Zeichnungsmaßstab ein, z. B. 100 für 1:100.'); return; }
     const mPerPx = f.pdf.ptPerPx * 0.000352778 * N;
-    const factor = (mPerPx * U) / (f.w / a.w);
-    pushUndo(); scaleFloor(f, factor); f.calibrated = true; routeCache.clear(); changed(); fit(f); toast('PDF-Maßstab 1:' + N + ' übernommen. Alle Kabellängen sind aktualisiert.');
+    const factor = (mPerPx * U) / (f.w / cropOf(f).w);
+    pushUndo(); scaleFloor(f, factor); f.calibrated = true; f.pdfScale = N; routeCache.clear(); changed(); fit(f); toast('PDF-Maßstab 1:' + N + ' übernommen. Alle Kabellängen sind aktualisiert.');
   }
   function zoomTo(pts) { if (!pts) return; let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity; pts.forEach(p => { x1 = Math.min(x1, p.x); y1 = Math.min(y1, p.y); x2 = Math.max(x2, p.x); y2 = Math.max(y2, p.y); }); fit({ x: x1, y: y1, w: Math.max(x2 - x1, 4 * U), h: Math.max(y2 - y1, 3 * U) }); }
 
@@ -1375,12 +1645,14 @@ export async function openEditor(root, opts) {
       case 'clearpins': pushUndo(); cableById(sel.cable).wps = []; changed(); break;
       case 'pinhint': toast('Doppelklick auf das Kabel setzt einen Pin. Rechtsklick → „Pin hinzufügen“ geht auch.'); break;
       case 'cancelMode': setMode('select'); break;
-      case 'addFloor': $('#fFloor', E).click(); break;
+      case 'addFloor': openFloorDialog(); break;
+      case 'addLevel': addLevel(); break;
+      case '3d': open3D(); break;
       case 'applyCalib': {
         const v = num($('#calM', E)?.value);
         if (!(v > 0)) { toast('Gib den echten Abstand ein, z. B. 12,5.'); return; }
         const d = dist(calib.p1, calib.p2); if (d < 1) { toast('Die Punkte liegen zu nah beieinander.'); return; }
-        const f = floorById(calib.floor) || S.floors.find(fl => calib.p1.x >= fl.x && calib.p1.x <= fl.x + fl.w && calib.p1.y >= fl.y && calib.p1.y <= fl.y + fl.h) || S.floors[0];
+        const f = floorById(calib.floor) || S.floors.find(fl => onLv(fl) && calib.p1.x >= fl.x && calib.p1.x <= fl.x + fl.w && calib.p1.y >= fl.y && calib.p1.y <= fl.y + fl.h) || S.floors[0];
         pushUndo(); scaleFloor(f, fromUser(v) * U / d); f.calibrated = true; routeCache.clear(); setMode('select'); changed(); fit(f);
         toast(`Maßstab gesetzt: ${v.toLocaleString('de-DE')} ${uName()}. Alle Kabellängen sind aktualisiert.`, 4000);
         break;
@@ -1401,7 +1673,6 @@ export async function openEditor(root, opts) {
   }
   E.querySelector('.ed-top').addEventListener('click', e => { const b = e.target.closest('[data-act]'); if (b) act(b.dataset.act); });
   on($('#hud', E), 'click', e => { const b = e.target.closest('[data-act]'); if (b) act(b.dataset.act); });
-  on($('#fFloor', E), 'change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) uploadFloor(f); });
   const nameEl = $('#edName', E); nameEl.value = meta.name || '';
   on(nameEl, 'input', () => { if (!readonly) setMeta('name', nameEl.value.trim() || 'Ohne Namen'); });
   on(nameEl, 'keydown', e => { if (e.key === 'Enter') nameEl.blur(); });
@@ -1433,12 +1704,13 @@ export async function openEditor(root, opts) {
 
   /* ---------- Export ---------- */
   const fileBase = () => (meta.name || 'plan').replace(/[^\wäöüÄÖÜß.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'plan';
-  async function exportCanvas({ scale = 2, bg = '#ffffff', floors = true, maxDim = 9000 } = {}) {
-    const saved = { ...view }, savedSel = sel; sel = { ids: new Set(), cable: null };
+  async function exportCanvas({ scale = 2, bg = '#ffffff', floors = true, maxDim = 9000, lv = curLv } = {}) {
+    const saved = { ...view }, savedSel = sel, savedLv = curLv, savedGh = ghosts; sel = { ids: new Set(), cable: null };
+    curLv = lv; ghosts = false;
     const b = contentBounds(floors);
     view = { x: 0, y: 0, z: 1 }; draw();
     try { return await renderPlanCanvas(svg, b, { scale, bg, floors, maxDim }); }
-    finally { view = saved; sel = savedSel; draw(); }
+    finally { view = saved; sel = savedSel; curLv = savedLv; ghosts = savedGh; draw(); }
   }
   function openExport() {
     const m = modal(`<header><h2>Export</h2><button class="btn sm" data-x>Schließen</button></header>
@@ -1452,6 +1724,7 @@ export async function openEditor(root, opts) {
             <label class="fld"><span>Papier</span><select class="inp" id="xPaper"><option>A4</option><option selected>A3</option><option>A2</option><option>Letter</option></select></label>
             <label class="fld"><span>Ausrichtung</span><select class="inp" id="xLand"><option value="1">Quer</option><option value="0">Hoch</option></select></label>
           </div>
+          <p class="hint small" id="xLvHint">${S.levels.length > 1 ? `PDF: eine Planseite je Ebene. PNG/JPG: die angezeigte Ebene („${esc(lvById(curLv).name)}“).` : ''}</p>
           <div class="chkrow"><label class="chk"><input type="checkbox" id="xFloors" checked> Grundrisse</label><label class="chk"><input type="checkbox" id="xWhite" checked> Weißer Hintergrund</label></div>
           <div class="chkrow" id="xPdfLists"><label class="chk"><input type="checkbox" id="xPack" checked> Packliste anhängen</label><label class="chk"><input type="checkbox" id="xPatch" checked> Patchliste anhängen</label></div>
           <button class="btn pri" id="xGo">Exportieren</button>
@@ -1481,16 +1754,19 @@ export async function openEditor(root, opts) {
   async function exportPdf({ plan = true, pack = true, patch = true, scale = 2, floors = true, paper = 'A3', landscape = true }) {
     const pages = [];
     if (plan) {
-      const cv = await exportCanvas({ scale, bg: '#ffffff', floors, maxDim: 7000 });
-      const blob = await canvasBlob(cv, 'image/jpeg', 0.9);
-      pages.push({ kind: 'image', jpeg: new Uint8Array(await blob.arrayBuffer()), w: cv.width, h: cv.height, title: 'Plan' });
+      const used = lvSorted().filter(l => S.levels.length === 1 || S.items.some(o => o.lv === l.id) || S.floors.some(o => o.lv === l.id) || S.shapes.some(o => o.lv === l.id));
+      for (const l of used) {
+        const cv = await exportCanvas({ scale, bg: '#ffffff', floors, maxDim: 7000, lv: l.id });
+        const blob = await canvasBlob(cv, 'image/jpeg', 0.9);
+        pages.push({ kind: 'image', jpeg: new Uint8Array(await blob.arrayBuffer()), w: cv.width, h: cv.height, title: S.levels.length > 1 ? `Plan – ${l.name}` : 'Plan' });
+      }
     }
     if (pack) {
       const d = packData(); const rows = [];
       const sec = (t) => rows.push({ group: t });
       const chk = (k) => (checks[k] ? '✓' : '');
-      sec('Geräte'); d.devs.forEach(x => rows.push({ cells: [chk(x.key), x.qty + '×', x.name, (S.packZones && x.zone ? x.zone + ' · ' : '') + x.labels.join(', ')] }));
-      sec('Kabel'); d.cabs.forEach(x => rows.push({ cells: [chk(x.key), x.qty + '×', `${typeOf(x.type).name} ${fmtLen(x.len)}${x.drum ? ' (Trommel)' : ''}`, (S.packZones && x.zone ? x.zone + ' · ' : '') + x.ids.join(', ')] }));
+      sec('Geräte'); d.devs.forEach(x => rows.push({ cells: [chk(x.key), x.qty + '×', x.name, (x.zone ? x.zone + ' · ' : '') + x.labels.join(', ')] }));
+      sec('Kabel'); d.cabs.forEach(x => rows.push({ cells: [chk(x.key), x.qty + '×', `${typeOf(x.type).name} ${fmtLen(x.len)}${x.drum ? ' (Trommel)' : ''}`, (x.zone ? x.zone + ' · ' : '') + x.ids.join(', ')] }));
       if (d.adapters.length) { sec('Adapter und Wandler'); d.adapters.forEach(x => rows.push({ cells: [chk(x.key), x.qty + '×', x.name, ''] })); }
       if (S.extras.length) { sec('Extras'); S.extras.forEach(e => rows.push({ cells: [chk('e|' + e.id), (e.qty || 1) + '×', e.name, ''] })); }
       pages.push({ kind: 'table', title: 'Packliste', columns: [{ label: 'OK', w: 30 }, { label: 'Anz.', w: 45, align: 'right' }, { label: 'Artikel', w: 300, bold: true }, { label: 'Details', w: 420 }], rows, footer: `Gesamt: ${fmtLen(d.total)} Kabel` });
@@ -1503,7 +1779,7 @@ export async function openEditor(root, opts) {
     download(blob, `${fileBase()}${plan ? '' : pack && !patch ? '-packliste' : !pack && patch ? '-patchliste' : ''}.pdf`, 'application/pdf');
   }
   function packRows() {
-    const d = packData(); const rows = [['Bereich', 'Zone', 'Artikel', 'Anzahl', 'Länge (' + uName() + ')', 'Details', 'Gepackt']];
+    const d = packData(); const rows = [['Bereich', 'Ebene / Zone', 'Artikel', 'Anzahl', 'Länge (' + uName() + ')', 'Details', 'Gepackt']];
     d.devs.forEach(x => rows.push(['Gerät', x.zone || '', x.name, x.qty, '', x.labels.join(', '), checks[x.key] ? 'ja' : 'nein']));
     d.cabs.forEach(x => rows.push(['Kabel', x.zone || '', typeOf(x.type).name, x.qty, fmtNum(toUser(x.len), 1), x.ids.join(', '), checks[x.key] ? 'ja' : 'nein']));
     d.adapters.forEach(x => rows.push(['Adapter', '', x.name, x.qty, '', '', checks[x.key] ? 'ja' : 'nein']));
@@ -1511,7 +1787,7 @@ export async function openEditor(root, opts) {
     return rows;
   }
   function patchCsvRows() {
-    const rows = [['ID', 'Typ', 'Quelle', 'Quell-Zone', 'Ziel', 'Ziel-Zone', 'Richtung', `Weg (${uName()})`, `Berechnet (${uName()})`, `Packlänge (${uName()})`, 'Adapter', 'Notiz']];
+    const rows = [['ID', 'Typ', 'Quelle', 'Quelle (Ebene / Zone)', 'Ziel', 'Ziel (Ebene / Zone)', 'Richtung', `Weg (${uName()})`, `Berechnet (${uName()})`, `Packlänge (${uName()})`, 'Adapter', 'Notiz']];
     patchRows().forEach(r => rows.push([r.id, r.type, r.from, r.fromZone, r.to, r.toZone, r.bi ? 'bidirektional' : '→', fmtNum(toUser(r.geo), 2), r.nocable ? '' : fmtNum(toUser(r.calc), 2), r.nocable ? 'Funk' : fmtNum(toUser(r.pack), 1), r.ad, r.notes]));
     return rows;
   }
@@ -1524,13 +1800,30 @@ export async function openEditor(root, opts) {
     return t + `\nGesamt: ${fmtLen(d.total)} Kabel`;
   }
 
+  /* ---------- 3D ---------- */
+  function scene3D() {
+    return {
+      U, cur: curLv, dark: document.documentElement.dataset.theme === 'dark' || (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches),
+      levels: S.levels.map(l => ({ id: l.id, name: l.name, elev: l.elev })),
+      floors: S.floors.filter(f => f.visible !== false && assets.get(f.asset)).map(f => { const a = assets.get(f.asset); return { lv: f.lv, url: assetUrl(f.asset), x: f.x, y: f.y, w: f.w, h: f.h, crop: cropOf(f), aw: a.w, ah: a.h, opacity: f.opacity ?? 0.9 }; }),
+      items: S.items.map(it => { const b = itemBox(it); return { id: it.id, lv: it.lv, x: b.x, y: b.y, w: b.w, h: b.h, color: it.color, name: itemName(it) }; }),
+      cables: S.cables.map(c => { const pts = cablePts(c), a = itemById(c.from.item), b = itemById(c.to.item); return pts && a && b ? { pts, from: a.id, to: b.id, lvA: a.lv, lvB: b.lv, color: typeOf(c.type).color, radio: !!typeOf(c.type).nocable } : null; }).filter(Boolean),
+      zones: S.shapes.filter(s => s.kind === 'zone').map(z => ({ lv: z.lv, x: z.x, y: z.y, w: z.w, h: z.h, color: COLORS[z.color] || z.color || COLORS.blue, label: z.label || '' })),
+      title: meta.name || 'Plan',
+    };
+  }
+  async function open3D() {
+    try { const m = await import('./view3d.js'); await m.open3D(scene3D(), { fileBase: fileBase() }); }
+    catch (e) { console.error(e); toast('Die 3D-Ansicht konnte nicht geladen werden: ' + e.message, 6000, 'bad'); }
+  }
+
   /* ---------- Hilfe ---------- */
   function showHelp() {
     modal(`<header><h2>Tastenkürzel</h2><button class="btn sm" data-x>Schließen</button></header><div class="mb"><table class="keys">
       ${[['V', 'Auswählen'], ['K', 'Maßstab am Grundriss setzen'], ['M', 'Strecke messen'], ['Shift D', 'Zeichenwerkzeuge ein/aus'], ['T / Z', 'Text / Zone zeichnen'], ['L', 'Ausrichtung Oben→Unten / Links→Rechts'],
          ['F', 'Alles einpassen'], ['+ / −', 'Zoomen'], ['G', 'Raster ein/aus'], ['Strg Z / Strg Shift Z', 'Rückgängig / Wiederholen'], ['Strg D', 'Duplizieren'], ['Strg C / V', 'Kopieren / Einfügen'],
          ['Strg A', 'Alles auswählen'], ['Entf', 'Löschen'], ['Pfeiltasten', 'Verschieben (Shift = 1 m)'], ['Shift + Ziehen', 'Rahmenauswahl'], ['Doppelklick Kabel', 'Pin setzen'], ['Doppelklick Gerät', 'Ports bearbeiten'],
-         ['Alt + Zone ziehen', 'Zone ohne Inhalt verschieben'], ['Rechtsklick / lange drücken', 'Kontextmenü'], ['Strg S', 'Sofort speichern'], ['Esc', 'Abbrechen']].map(([k, v]) => `<tr><td><kbd>${k}</kbd></td><td>${v}</td></tr>`).join('')}
+         ['Alt + Zone ziehen', 'Zone ohne Inhalt verschieben'], ['Bild ↑ / Bild ↓', 'Ebene wechseln'], ['Doppelklick Ebene', 'Ebene umbenennen'], ['Doppelklick blasses Gerät', 'Zu seiner Ebene springen'], ['Rechtsklick / lange drücken', 'Kontextmenü'], ['Strg S', 'Sofort speichern'], ['Esc', 'Abbrechen']].map(([k, v]) => `<tr><td><kbd>${k}</kbd></td><td>${v}</td></tr>`).join('')}
     </table></div>`);
   }
 
