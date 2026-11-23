@@ -1017,6 +1017,7 @@ export async function openEditor(root, opts) {
     on($('#lib', E), 'click', e => {
       const lt = e.target.closest('[data-ltab],[data-ltab2]');
       if (lt) { libTab = lt.dataset.ltab || lt.dataset.ltab2; $$('[data-ltab]', E).forEach(b => b.classList.toggle('on', b.dataset.ltab === libTab)); if (libTab === 'community' && !community) loadCommunity(); renderLib(); return; }
+      const ab = e.target.closest('[data-act]'); if (ab) { act(ab.dataset.act); return; }
       const c = e.target.closest('[data-gear]'); if (c) { const g = gearById(c.dataset.gear); if (g) addGear(g); }
     });
     on($('#lib', E), 'dragstart', e => { const c = e.target.closest('[data-gear]'); if (c) { const g = gearById(c.dataset.gear); e.dataTransfer.setData('application/x-pp-gear', JSON.stringify(g)); e.dataTransfer.effectAllowed = 'copy'; } });
