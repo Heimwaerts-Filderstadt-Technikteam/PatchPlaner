@@ -799,6 +799,8 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
   const isPdfFile = (f) => f && (f.type === 'application/pdf' || /\.pdf$/i.test(f.name));
   const pdfSources = () => [...assets.values()].filter(a => a.kind === 'pdfsrc');
   const isSvgFile = (f) => f && (f.type === 'image/svg+xml' || /\.svg$/i.test(f.name));
+  const isDxfFile = (f) => f && /\.dxf$/i.test(f.name);
+  const isDwgFile = (f) => f && /\.dwg$/i.test(f.name);
   const lvScale = (lv) => lvById(lv).scale || (S.levels.find(l => l.scale) || {}).scale || 100;
   function openFloorDialog({ file = null, lv = curLv, srcPdf = null, replaceFloor = null } = {}) {
     if (readonly) return;
@@ -810,8 +812,8 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
         <label class="row"><span>Ebene</span><select class="inp" id="fdLv">${lvSorted().map(l => `<option value="${l.id}"${l.id === lv ? ' selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
         <div class="sec"><h3>Quelle</h3>
           <div class="fdsrc">
-            <label class="chk"><input type="radio" name="fdS" value="file"${srcPdf ? '' : ' checked'}> Datei (PDF, SVG oder Bild)</label>
-            <div class="inline" id="fdFileRow"><input type="file" id="fdFile" accept="image/*,.svg,.pdf,application/pdf"><span class="small muted" id="fdFileName">${chosen ? esc(chosen.name) : ''}</span></div>
+            <label class="chk"><input type="radio" name="fdS" value="file"${srcPdf ? '' : ' checked'}> Datei (PDF, DXF, SVG oder Bild)</label>
+            <div class="inline" id="fdFileRow"><input type="file" id="fdFile" accept="image/*,.svg,.pdf,application/pdf,.dxf,.dwg"><span class="small muted" id="fdFileName">${chosen ? esc(chosen.name) : ''}</span></div>
             ${srcs.length ? `<label class="chk"><input type="radio" name="fdS" value="pdf"${srcPdf ? ' checked' : ''}> Aus einem schon geladenen PDF</label>
             <select class="inp" id="fdPdf">${srcs.map(a => `<option value="${a.id}"${a.id === srcPdf ? ' selected' : ''}>${esc(a.filename || 'PDF')} – ${a.meta?.pages || 1} Seite${(a.meta?.pages || 1) === 1 ? '' : 'n'}</option>`).join('')}</select>` : ''}
           </div>
@@ -826,24 +828,29 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
           </div>
           <p class="hint small" id="fdVecHint" hidden>„Nur Wände und Fenster“ geht mit PDF (braucht pdftocairo auf dem Server) und SVG. Bei PNG/JPG wird die ganze Zeichnung übernommen.</p>
         </div>
+        <p class="hint" id="fdDxfHint" hidden><b>DXF</b> ist in echten Maßen gezeichnet – ein Maßstab ist nicht nötig. Im nächsten Schritt wählst du die Layer (Wände und Fenster sind vorausgewählt).</p>
+        <div class="warnbox" id="fdDwgHint" hidden>DWG kann PatchPlaner nicht direkt lesen. Öffne die Datei in <b>LibreCAD</b> (kostenlos) und speichere sie über „Speichern unter“ als <b>DXF</b> – die lädst du dann hier hoch. Die Layer bleiben dabei erhalten.</div>
         <label class="chk" id="fdRepRow"><input type="checkbox" id="fdRep" checked> Vorhandenen Grundriss dieser Ebene ersetzen</label>
         <div class="errbox" hidden id="fdErr"></div>
       </div>
       <footer><button class="btn" data-x>Abbrechen</button><button class="btn pri" id="fdGo">Weiter</button></footer>`);
     const q = (x) => m.el.querySelector(x);
     const srcMode = () => (m.el.querySelector('input[name=fdS]:checked') || {}).value || 'file';
-    const kind = () => (srcMode() === 'pdf' || isPdfFile(chosen) ? 'pdf' : isSvgFile(chosen) ? 'svg' : chosen ? 'img' : 'pdf');
+    const kind = () => (srcMode() === 'pdf' || isPdfFile(chosen) ? 'pdf' : isSvgFile(chosen) ? 'svg' : isDxfFile(chosen) ? 'dxf' : isDwgFile(chosen) ? 'dwg' : chosen ? 'img' : 'pdf');
     const upd = () => {
       const k = kind();
       q('#fdPageRow').hidden = k !== 'pdf';
-      q('#fdScaleRow').hidden = k === 'img';
+      q('#fdScaleRow').hidden = k === 'img' || k === 'dxf' || k === 'dwg';
+      q('#fdModeSec').hidden = k === 'dxf' || k === 'dwg';
+      q('#fdDxfHint').hidden = k !== 'dxf'; q('#fdDwgHint').hidden = k !== 'dwg';
+      q('#fdGo').disabled = k === 'dwg';
       const vec = (k === 'pdf' && vecOk) || k === 'svg';
       q('#fdMVec').hidden = !vec; q('#fdVecHint').hidden = vec;
       if (!vec && q('input[name=fdM][value=vec]').checked) q('input[name=fdM][value=draw]').checked = true;
       if (srcMode() === 'pdf' && q('#fdPdf')) { const a = assets.get(q('#fdPdf').value); q('#fdPage').max = a?.meta?.pages || 1; }
       const has = S.floors.some(f => f.lv === q('#fdLv').value);
       q('#fdRepRow').hidden = !has;
-      q('#fdGo').textContent = q('input[name=fdM]:checked').value === 'vec' && vec ? 'Weiter zur Vorschau' : 'Übernehmen';
+      q('#fdGo').textContent = (q('input[name=fdM]:checked').value === 'vec' && vec) || k === 'dxf' ? 'Weiter zur Vorschau' : 'Übernehmen';
     };
     m.el.addEventListener('change', (e) => {
       if (e.target.id === 'fdFile') { chosen = e.target.files[0] || null; q('#fdFileName').textContent = ''; const r = m.el.querySelector('input[value=file]'); if (r) r.checked = true; }
@@ -859,6 +866,13 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
       const how = q('input[name=fdM]:checked').value, k = kind();
       const btn = q('#fdGo'); btn.disabled = true; btn.textContent = 'Wird umgewandelt …';
       try {
+        if (k === 'dxf') {
+          const V = await import('./vecfloor.js');
+          const model = V.parseDXF(await chosen.text());
+          m.close();
+          await openVecFilter({ model, paper: 100, fixed: true, scale: 1, lv: lv2, replace, name: chosen.name.replace(/\.dxf$/i, ''), src: null, page: null, pages: 1 });
+          return;
+        }
         if (how === 'vec' && (k === 'svg' || (k === 'pdf' && vecOk))) {
           let text, src = null, pages = 1, name, unitMm = null;
           if (k === 'svg') { text = await chosen.text(); name = chosen.name.replace(/\.svg$/i, ''); }
@@ -882,15 +896,13 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
   }
 
   /* Vorschau und Korrektur: nur Wände und Fenster übernehmen */
-  async function openVecFilter({ text, unitMm, scale, lv, replace, name, src, page, pages }) {
+  async function openVecFilter({ text, unitMm, model = null, paper = 1, fixed = false, scale, lv, replace, name, src, page, pages }) {
     const V = await import('./vecfloor.js');
-    let model;
-    try { model = V.parseSVG(text, { unitMm }); } catch (e) { toast(e.message || 'Die Zeichnung konnte nicht gelesen werden.', 5000); return; }
+    if (!model) { try { model = V.parseSVG(text, { unitMm }); } catch (e) { toast(e.message || 'Die Zeichnung konnte nicht gelesen werden.', 5000); return; } }
     if (!model.els.length) { toast('In der Datei sind keine Linien. Ist das PDF ein eingescanntes Bild? Dann „Ganze Zeichnung ohne weißen Hintergrund“ wählen.', 7000); return; }
     const layerNames = model.layers.map(l => l.name);
     const useLayers = layerNames.length >= 2;
-    const keepRe = /wand|wände|waende|wall|mauer|fenster|window|glas|stütze|stuetze|column|tragwerk|beton|rohbau|a-wall|a-glaz/i;
-    const st = { cls: {}, windows: true, sheet: true, tolMm: 0.7, showOff: true, mode: useLayers ? 'layers' : 'auto', layers: Object.fromEntries(layerNames.map(n => [n, keepRe.test(n)])) };
+    const st = { cls: {}, windows: true, sheet: !fixed, tolMm: 0.7, showOff: true, mode: useLayers ? 'layers' : 'auto', layers: Object.fromEntries(layerNames.map(n => [n, V.keepLayer(n)])) };
     if (useLayers && !Object.values(st.layers).some(Boolean)) st.mode = 'auto';
     let cl = null;
     const m = modal(`<header><h2>Grundriss prüfen – ${esc(name)}</h2><button class="btn sm" data-x>Schließen</button></header>
@@ -898,8 +910,10 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
         <div class="vf-prev"><canvas id="vfCv"></canvas><div class="vf-leg"><span><i class="k-wall"></i>Wand</span><span><i class="k-win"></i>Fenster</span><span><i class="k-off"></i>wird entfernt</span></div></div>
         <div class="vf-side">
           <p class="vf-sum" id="vfSum"></p>
+          ${model.dxf ? `<label class="row"><span>Einheit der Zeichnung</span><select class="inp sm" id="vfUnit">${[[1, 'mm'], [10, 'cm'], [1000, 'm'], [25.4, 'Zoll'], [304.8, 'Fuß']].map(([v, n]) => `<option value="${v}"${Math.abs(model.unitMm - v) < 1e-9 ? ' selected' : ''}>${n}</option>`).join('')}</select></label>
+          <p class="small muted" id="vfSize"></p>` : ''}
           ${useLayers ? `<div class="seg" id="vfMode"><button data-vm="layers">Nach Layern</button><button data-vm="auto">Automatisch</button></div>
-          <div id="vfLayers" class="vf-list">${model.layers.map(l => `<label class="chk"><input type="checkbox" data-vl="${esc(l.name)}"> ${esc(l.name)} <span class="small muted">${l.n}</span></label>`).join('')}</div>` : ''}
+          <div id="vfLayers" class="vf-list">${model.layers.map(l => `<label class="chk"><input type="checkbox" data-vl="${esc(l.name)}">${l.color ? `<span class="dot" style="background:${l.color}"></span>` : ''} ${esc(l.name)} <span class="small muted">${l.n}</span></label>`).join('')}</div>` : ''}
           <div id="vfAuto">
             <h3 class="vf-h">Linienarten</h3>
             <div id="vfCls" class="vf-list"></div>
@@ -916,9 +930,10 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     const q = (x) => m.el.querySelector(x);
     const cv = q('#vfCv');
     const run = () => {
-      cl = V.classify(model, { scale, cls: st.cls, windows: st.windows, sheet: st.sheet, tolMm: st.tolMm, layers: st.mode === 'layers' ? Object.fromEntries(Object.entries(st.layers).concat([['(ohne Layer)', false]])) : null });
+      cl = V.classify(model, { scale, paper, cls: st.cls, windows: st.windows, sheet: st.sheet, tolMm: st.tolMm, layers: st.mode === 'layers' ? Object.fromEntries(Object.entries(st.layers).concat([['(ohne Layer)', false]])) : null });
       V.drawPreview(cv, model, cl, { showOff: st.showOff });
       const c = cl.counts;
+      if (q('#vfSize')) q('#vfSize').textContent = `Größe der Zeichnung: ${fmtNum(toUser(model.W * model.unitMm / 1000), 1)} × ${fmtLen(model.H * model.unitMm / 1000, 1)}${model.unitGuess ? ' – Einheit geschätzt, bitte prüfen' : ''}`;
       q('#vfSum').innerHTML = `<b>Übernommen:</b> ${c.wall + c.detail} Wandteile${c.window ? `, ${c.window} Fensterlinien` : ''}<br><b>Entfernt:</b> ${c.text} Textzeichen${c.sheet ? `, ${c.sheet === 1 ? 'Plankopf/Legende' : 'Plankopf und Legende'}` : ''}, ${c.off} sonstige Linien`;
       if (q('#vfMode')) { q('#vfMode').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.vm === st.mode)); q('#vfLayers').hidden = st.mode !== 'layers'; q('#vfAuto').hidden = st.mode === 'layers'; m.el.querySelectorAll('[data-vl]').forEach(i => { i.checked = !!st.layers[i.dataset.vl]; }); }
       if (st.mode !== 'layers') {
@@ -934,6 +949,7 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
       if (t.id === 'vfWin') st.windows = t.checked;
       if (t.id === 'vfSheet') st.sheet = t.checked;
       if (t.id === 'vfOff') st.showOff = t.checked;
+      if (t.id === 'vfUnit') { const nu = +t.value, f = model.unitMm / nu; model.els.forEach(el => { el.sw *= f; }); model.unitMm = nu; model.unitGuess = false; }
       run();
     });
     m.el.addEventListener('input', (e) => { if (e.target.id === 'vfTol') { st.tolMm = +e.target.value; run(); } });
@@ -943,13 +959,13 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     q('#vfGo').onclick = async () => {
       const btn = q('#vfGo'); btn.disabled = true; btn.textContent = 'Wird gespeichert …';
       try {
-        const out = V.buildSVG(model, cl);
+        const out = V.buildSVG(model, cl, { paper });
         const blob = new Blob([out.svg], { type: 'image/svg+xml' });
         const ptPerPx = model.unitMm / (25.4 / 72);
-        const res = await api.upload(`/api/plans/${planId}/assets`, blob, 'image/svg+xml', name + '.svg', { ptPerPx, page: page || 1, pages, vector: true, ox: out.ox, oy: out.oy, src: src || undefined });
+        const res = await api.upload(`/api/plans/${planId}/assets`, blob, 'image/svg+xml', name + '.svg', { ptPerPx, page: page || 1, pages, vector: true, ox: (model.ox0 || 0) + out.ox, oy: (model.oy0 || 0) + out.oy, src: src || undefined });
         assets.set(res.id, { ...res, kind: 'floor' });
         ro.disconnect(); m.close();
-        placeFloor(res, { lv, replace, name, scale, vector: true });
+        placeFloor(res, { lv, replace, name, scale, vector: true, fixed });
       } catch (e) { toast(e.message || 'Speichern fehlgeschlagen.', 5000); btn.disabled = false; btn.textContent = 'Übernehmen'; }
     };
   }
@@ -980,27 +996,27 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
   // Ursprung der Original-Blattkoordinaten in Weltkoordinaten (für das Ausrichten von Ebenen aus demselben Plansatz)
   function pageOrigin(f) { const c = cropOf(f), k = f.w / c.w; return { x: f.x - (c.x + (f.pdf?.ox || 0)) * k, y: f.y - (c.y + (f.pdf?.oy || 0)) * k }; }
   const worldPerPx = (f, N) => f.pdf.ptPerPx * 0.000352778 * N * U;
-  function placeFloor(res, { lv, replace, name, scale = null, vector = false }) {
+  function placeFloor(res, { lv, replace, name, scale = null, vector = false, fixed = false }) {
     pushUndo();
     const old = replace ? floorById(replace) : null;
     const f = { id: uid(), lv, asset: res.id, src: res.meta?.src || null, page: res.meta?.page || null, name, x: 0, y: 0, w: 0, h: 0, w0: res.w, opacity: vector ? 1 : 0.9, visible: true, invert: true,
-      calibrated: false, locked: true, transparent: !!res.meta?.transparent || vector, vector, pdf: res.meta && res.meta.ptPerPx ? { ptPerPx: res.meta.ptPerPx, ox: res.meta.ox || 0, oy: res.meta.oy || 0 } : null };
+      calibrated: false, locked: true, transparent: !!res.meta?.transparent || vector, vector, page: fixed ? null : res.meta?.page || null, pdf: res.meta && res.meta.ptPerPx ? { ptPerPx: res.meta.ptPerPx, ox: res.meta.ox || 0, oy: res.meta.oy || 0, fixed } : null };
     if (f.pdf && scale > 0) {
       // Maßstab bekannt: Größe direkt aus dem Zeichnungsmaßstab, Lage nach Blattkoordinaten wie die anderen Ebenen
       const k = worldPerPx(f, scale); f.w = res.w * k; f.h = res.h * k;
-      const pdfs = S.floors.filter(o => o !== old && o.pdf && o.calibrated);
+      const pdfs = S.floors.filter(o => o !== old && o.pdf && o.calibrated && !!o.pdf.fixed === fixed);   // DXF mit DXF, PDF mit PDF ausrichten
       const ref = (old && old.pdf && old.calibrated ? old : null) || pdfs.find(o => o.src && o.src === f.src) || pdfs.sort((a, b) => (a.lv === lv) - (b.lv === lv))[0] || null;
       let o0 = ref ? pageOrigin(ref) : null;
       if (!o0 && old) o0 = { x: old.x - f.pdf.ox * k, y: old.y - f.pdf.oy * k };
       if (!o0) { const b = S.items.some(i => i.lv === lv) ? contentBounds(false, lv) : null; o0 = b ? { x: b.x - f.pdf.ox * k, y: b.y - f.pdf.oy * k } : { x: -f.pdf.ox * k, y: -f.pdf.oy * k }; }
-      f.x = o0.x + f.pdf.ox * k; f.y = o0.y + f.pdf.oy * k; f.calibrated = true; f.pdfScale = scale;
-      lvById(lv).scale = scale;
+      f.x = o0.x + f.pdf.ox * k; f.y = o0.y + f.pdf.oy * k; f.calibrated = true; f.pdfScale = fixed ? null : scale;
+      if (!fixed) lvById(lv).scale = scale;
       if (old) S.floors = S.floors.filter(o => o !== old);
       S.floors.push(f);
       if (lv !== curLv) switchLevel(lv, true);
       const auto = enableRealOnce();
       changed(); fit(f); tab = 'plan'; renderPane();
-      toast(`Maßstab 1:${scale} – die Kabellängen stimmen damit.` + (ref ? ` Lage wie „${lvById(ref.lv).name}“ (gleiche Blattkoordinaten); sonst mit „Verschieben“ anpassen.` : '') + (auto ? ' Geräte werden jetzt maßstäblich gezeigt.' : ''), 6500);
+      toast((fixed ? 'Echte Maße aus der DXF übernommen – die Kabellängen stimmen damit.' : `Maßstab 1:${scale} – die Kabellängen stimmen damit.`) + (ref ? ` Lage wie „${lvById(ref.lv).name}“ (gleiche ${fixed ? 'Zeichnungskoordinaten' : 'Blattkoordinaten'}); sonst mit „Verschieben“ anpassen.` : '') + (auto ? ' Geräte werden jetzt maßstäblich gezeigt.' : ''), 6500);
       return;
     }
     // Lage und Maßstab: vom ersetzten Grundriss oder von einem kalibrierten PDF einer anderen Ebene übernehmen
@@ -1317,7 +1333,7 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     const raw = e.dataTransfer.getData('application/x-pp-gear');
     if (raw) { try { addGear(JSON.parse(raw), toWorld(e)); } catch { /* egal */ } return; }
     const f = e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f && (/^image\//.test(f.type) || /\.pdf$/i.test(f.name))) openFloorDialog({ file: f });
+    if (f && (/^image\//.test(f.type) || /\.(pdf|svg|dxf|dwg)$/i.test(f.name))) openFloorDialog({ file: f });
   });
 
   /* ---------- Zeichenwerkzeuge ---------- */
@@ -1692,9 +1708,9 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     <div class="sec"><h3>Grundriss – ${esc(lvById(curLv).name)} ${readonly ? '' : '<button class="btn sm" data-a="addFloor">+ Laden</button>'}</h3>
       ${S.floors.filter(onLv).length ? S.floors.filter(onLv).map(f => `<div class="floorrow">
         <div class="fr-head"><input class="inp sm" data-fname="${f.id}" value="${esc(f.name)}" aria-label="Name des Grundrisses"> ${f.calibrated ? '<span class="chip ok">kalibriert</span>' : '<span class="chip warn">nicht kalibriert</span>'}</div>
-        <div class="small muted">${fmtNum(toUser(f.w / U), 1)} × ${fmtLen(f.h / U, 1)}${f.page ? ` · PDF-Seite ${f.page}` : ''}${f.vector ? ' · nur Wände und Fenster' : f.transparent ? ' · nur Zeichnung' : ''}${f.crop ? ' · zugeschnitten' : ''}</div>
+        <div class="small muted">${fmtNum(toUser(f.w / U), 1)} × ${fmtLen(f.h / U, 1)}${f.page ? ` · PDF-Seite ${f.page}` : ''}${f.pdf?.fixed ? ' · DXF, echte Maße' : ''}${f.vector ? ' · nur Wände und Fenster' : f.transparent ? ' · nur Zeichnung' : ''}${f.crop ? ' · zugeschnitten' : ''}</div>
         ${readonly ? '' : `<div class="btnrow"><button class="btn sm pri" data-fa="calib" data-f="${f.id}">Maßstab</button><button class="btn sm" data-fa="lock" data-f="${f.id}">${f.locked === false ? 'Fixieren' : 'Verschieben'}</button><button class="btn sm" data-fa="crop" data-f="${f.id}">Zuschneiden</button>${f.crop ? `<button class="btn sm" data-fa="uncrop" data-f="${f.id}">Zuschnitt aufheben</button>` : ''}${f.transparent || f.vector ? '' : `<button class="btn sm" data-fa="clear" data-f="${f.id}">Weiß entfernen</button>`}${f.src ? `<button class="btn sm" data-fa="page" data-f="${f.id}">Andere Seite</button>` : ''}<button class="btn sm" data-fa="zoom" data-f="${f.id}">Zeigen</button><button class="btn sm bad" data-fa="del" data-f="${f.id}">Entfernen</button></div>
-        ${f.pdf ? `<label class="row"><span>Maßstab 1:</span><span class="inline"><input class="inp sm" data-pdfscale="${f.id}" type="number" min="1" value="${lvById(f.lv).scale || f.pdfScale || ''}" placeholder="100"><button class="btn sm" data-fa="pdf" data-f="${f.id}">Anwenden</button></span></label>` : ''}
+        ${f.pdf && !f.pdf.fixed ? `<label class="row"><span>Maßstab 1:</span><span class="inline"><input class="inp sm" data-pdfscale="${f.id}" type="number" min="1" value="${lvById(f.lv).scale || f.pdfScale || ''}" placeholder="100"><button class="btn sm" data-fa="pdf" data-f="${f.id}">Anwenden</button></span></label>` : ''}
         <label class="row"><span>Deckkraft</span><input type="range" data-fop="${f.id}" min="0.1" max="1" step="0.05" value="${f.opacity ?? 0.9}"></label>
         <div class="chkrow"><label class="chk"><input type="checkbox" data-fvis="${f.id}"${f.visible !== false ? ' checked' : ''}> Anzeigen</label><label class="chk"><input type="checkbox" data-finv="${f.id}"${f.invert ? ' checked' : ''}> Im Dark Mode invertieren</label></div>`}
       </div>`).join('') : `<p class="hint">Diese Ebene hat noch keinen Grundriss. Weise ein PDF (auch eine bestimmte Seite) oder ein Bild zu. Danach den Maßstab setzen – oder er wird von einem kalibrierten PDF einer anderen Ebene übernommen.</p>${readonly ? '' : '<button class="btn pri" data-a="addFloor">Grundriss zuweisen</button>'}`}
@@ -1880,7 +1896,7 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     const l = lvById(lvId); if (!(N > 0)) { toast('Gib den Maßstab ein, z. B. 100 für 1:100.'); return; }
     pushUndo(); l.scale = N;
     let n = 0;
-    S.floors.filter(f => f.lv === lvId && f.pdf).forEach(f => {
+    S.floors.filter(f => f.lv === lvId && f.pdf && !f.pdf.fixed).forEach(f => {
       const o = pageOrigin(f), c = cropOf(f), k = worldPerPx(f, N);
       f.w = c.w * k; f.h = c.h * k; f.x = o.x + (c.x + (f.pdf.ox || 0)) * k; f.y = o.y + (c.y + (f.pdf.oy || 0)) * k; f.calibrated = true; f.pdfScale = N; n++;
     });

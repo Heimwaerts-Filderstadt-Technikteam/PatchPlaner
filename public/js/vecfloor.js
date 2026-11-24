@@ -277,6 +277,12 @@ function clipSubs(subs, b) {
   return out;
 }
 
+// Layer-Namen: was sind Wände, was Fenster? (deutsch, englisch, AIA-Kürzel wie A-WALL, A-GLAZ)
+export const WALL_RE = /wand|wände|waende|mauer|wall|stütze|stuetze|column|a-cols|s-cols|tragwerk|beton|rohbau|mauerwerk|brüstung|bruestung/i;
+export const WIN_RE = /fenster|window|glas|glaz|verglasung/i;
+export const OFF_RE = /möbel|moebel|furn|bemaß|bemass|dim|anno|text|schrift|achs|grid|raster|plankopf|rahmen|title|legende|möblierung|einrichtung|sanitär|sanitaer|elektro|hlk|tga|treppe|stair|tür|tuer|door|schraff|hatch|patt|boden|floor|decke|ceil|dach|roof/i;
+export const keepLayer = (n) => (WALL_RE.test(n) || WIN_RE.test(n)) && !/text|anno|dim|bemaß|bemass/i.test(n);   // Wand-Schraffur (Vollfläche) gehört dazu
+
 /* ---------- Klassen (gleiche Strichstärke/Farbe) ---------- */
 export function classKey(e) {
   if (e.fill && lum(e.fill) < 0.92 && (!e.stroke || e.sw < 0.01 || e.subs.every(s => s.closed))) return 'F|' + hex(e.fill.map(v => Math.round(v / 16) * 16));
@@ -301,7 +307,8 @@ export function classify(model, opts = {}) {
   const { W, H, els, texts, unitMm } = model;
   const scale = opts.scale || 100;
   const mmU = 1 / unitMm;                                   // SVG-Einheiten pro Papier-mm
-  const tol = (opts.tolMm ?? 0.7) * mmU;
+  const paper = opts.paper || 1;                            // DXF: echte Maße → Papiergrößen wie bei 1:100 umrechnen
+  const tol = (opts.tolMm ?? 0.7) * mmU * paper;
   const maxOpen = ((opts.maxOpenM ?? 4) * 1000 / scale) * mmU;
   const res = new Array(els.length).fill('off'), why = new Array(els.length).fill('');
   let stats = null, auto = null, total = 1;
@@ -315,9 +322,9 @@ export function classify(model, opts = {}) {
       const b = e.box, bw = b[2] - b[0], bh = b[3] - b[1];
       if (bw > W * 0.8 && bh > H * 0.8) { res[k] = 'off'; why[k] = 'frame'; return; }
       const isRect = e.subs.length === 1 && e.subs[0].closed && e.subs[0].pts.length <= 5 && e.subs[0].pts.every(p => (Math.abs(p[0] - b[0]) < 0.5 || Math.abs(p[0] - b[2]) < 0.5) && (Math.abs(p[1] - b[1]) < 0.5 || Math.abs(p[1] - b[3]) < 0.5));
-      if (!isRect || bw < 12 * mmU || bh < 8 * mmU || area(b) > W * H * 0.4) return;
+      if (!isRect || bw < 12 * mmU * paper || bh < 8 * mmU * paper || area(b) > W * H * 0.4) return;
       const n = texts.filter(t => inside(b, t.box)).length;
-      const dens = n / (area(b) / (100 * mmU * mmU));          // Zeichen pro cm²
+      const dens = n / (area(b) / (100 * mmU * mmU * paper * paper));          // Zeichen pro cm²
       if (n >= 12 && dens > 0.45) sheetBoxes.push(b);
     });
     els.forEach((e, k) => {
@@ -330,7 +337,7 @@ export function classify(model, opts = {}) {
 
   // 2. Layer-Modus: der Nutzer entscheidet über die Layer
   if (opts.layers) {
-    els.forEach((e, k) => { if (!why[k]) { const on = opts.layers[e.layer || '(ohne Layer)']; res[k] = on ? 'wall' : 'off'; why[k] = on ? 'layer' : 'layer-off'; } });
+    els.forEach((e, k) => { if (!why[k]) { const on = opts.layers[e.layer || '(ohne Layer)']; res[k] = on ? (WIN_RE.test(e.layer) ? 'window' : 'wall') : 'off'; why[k] = on ? 'layer' : 'layer-off'; } });
     return finish();
   }
 
@@ -403,12 +410,12 @@ export function classify(model, opts = {}) {
 }
 
 /** Sauberes SVG aus dem, was übernommen wird. Auf den Inhalt zugeschnitten; ox/oy = Versatz zur Originalseite. */
-export function buildSVG(model, cl, { keepText = false, colors = false, margin = 6 } = {}) {
+export function buildSVG(model, cl, { keepText = false, colors = false, margin = 6, paper = 1 } = {}) {
   const { els } = model;
   let b = [Infinity, Infinity, -Infinity, -Infinity];
   els.forEach((e, k) => { if (cl.kept[k]) { b[0] = Math.min(b[0], e.box[0] - e.sw); b[1] = Math.min(b[1], e.box[1] - e.sw); b[2] = Math.max(b[2], e.box[2] + e.sw); b[3] = Math.max(b[3], e.box[3] + e.sw); } });
   if (!isFinite(b[0])) throw new Error('Mit diesen Einstellungen bleibt nichts übrig. Markiere mindestens eine Linienart als Wand.');
-  const mg = margin / model.unitMm;
+  const mg = margin * paper / model.unitMm;
   const ox = Math.max(0, b[0] - mg), oy = Math.max(0, b[1] - mg);
   const w = Math.min(model.W, b[2] + mg) - ox, h = Math.min(model.H, b[3] + mg) - oy;
   const f = (v) => +v.toFixed(2);
@@ -449,4 +456,181 @@ export function drawPreview(cv, model, cl, { showOff = true } = {}) {
     if (e.fill && e.subs.every(s => s.closed) && lum(e.fill) < 0.92) { c.fillStyle = cl.res[i] === 'window' ? col.window : '#3c3c3c'; c.fill('evenodd'); }
     c.strokeStyle = col[cl.res[i]] || '#14181c'; c.lineWidth = Math.max(cl.res[i] === 'window' ? 1.2 : 1, e.sw * k); c.stroke();
   });
+}
+
+/* ---------- DXF (AutoCAD-Austauschformat, z. B. aus LibreCAD) ---------- */
+const ACI = { 1: [255, 0, 0], 2: [255, 255, 0], 3: [0, 255, 0], 4: [0, 255, 255], 5: [0, 0, 255], 6: [255, 0, 255], 7: [0, 0, 0], 8: [128, 128, 128], 9: [192, 192, 192], 250: [51, 51, 51], 251: [80, 80, 80], 252: [105, 105, 105], 253: [130, 130, 130], 254: [190, 190, 190], 255: [255, 255, 255] };
+const aci = (n) => ACI[Math.abs(n)] || [90, 90, 90];
+export const DXF_UNITS = { 1: ['Zoll', 25.4], 2: ['Fuß', 304.8], 4: ['mm', 1], 5: ['cm', 10], 6: ['m', 1000] };
+
+/**
+ * DXF einlesen. Liefert dasselbe Modell wie parseSVG (Koordinaten in Zeichnungseinheiten, y nach unten),
+ * plus unit/unitGuess, ox0/oy0 (Versatz zum Zeichnungsursprung, damit Ebenen aus einem Plansatz deckungsgleich liegen).
+ */
+export function parseDXF(text, { unitMm = null } = {}) {
+  if (/^AutoCAD Binary DXF/.test(text.slice(0, 22))) throw new Error('Binäre DXF-Dateien werden nicht unterstützt. Bitte als ASCII-DXF speichern (in LibreCAD: „Speichern unter“ → DXF).');
+  const L = text.split(/\r?\n/);
+  const pairs = [];
+  for (let i = 0; i + 1 < L.length; i += 2) { const c = parseInt(L[i], 10); if (isNaN(c)) { i--; continue; } pairs.push([c, L[i + 1].trim()]); }
+  if (!pairs.some(p => p[0] === 0 && p[1] === 'SECTION')) throw new Error('Die Datei ist keine gültige DXF.');
+  // in Gruppen „0 / TYP“ zerlegen
+  const recs = []; let cur = null, section = null, sub = null;
+  for (const [c, v] of pairs) {
+    if (c === 0) {
+      if (v === 'SECTION') { section = 'pending'; cur = null; continue; }
+      if (v === 'ENDSEC') { section = null; cur = null; continue; }
+      cur = { type: v, section, g: [] }; recs.push(cur); continue;
+    }
+    if (section === 'pending' && c === 2) { section = v; continue; }
+    if (cur) cur.g.push([c, v]);
+  }
+  const get = (r, code, def) => { const p = r.g.find(x => x[0] === code); return p ? p[1] : def; };
+  const num = (r, code, def = 0) => { const v = get(r, code); return v == null ? def : parseFloat(v); };
+  // Kopf: Einheiten
+  let insunits = null;
+  { const h = pairs.findIndex(p => p[0] === 9 && p[1] === '$INSUNITS'); if (h >= 0 && pairs[h + 1]) insunits = parseInt(pairs[h + 1][1], 10); }
+  // Layer
+  const layers = {};
+  recs.filter(r => r.section === 'TABLES' && r.type === 'LAYER').forEach(r => {
+    const name = get(r, 2, '0'), col = parseInt(get(r, 62, '7'), 10), fl = parseInt(get(r, 70, '0'), 10), lw = parseInt(get(r, 370, '-3'), 10);
+    layers[name] = { name, color: col, off: col < 0 || (fl & 1) === 1, lw: lw > 0 ? lw / 100 : 0.25 };
+  });
+  const layerOf = (n) => layers[n] || (layers[n] = { name: n, color: 7, off: false, lw: 0.25 });
+  // Blöcke
+  const blocks = {}; let blk = null;
+  recs.filter(r => r.section === 'BLOCKS').forEach(r => {
+    if (r.type === 'BLOCK') { blk = { name: get(r, 2, ''), bx: num(r, 10), by: num(r, 20), ents: [] }; blocks[blk.name] = blk; return; }
+    if (r.type === 'ENDBLK') { blk = null; return; }
+    if (blk) blk.ents.push(r);
+  });
+  const ents = recs.filter(r => r.section === 'ENTITIES');
+
+  // Entitäten → Polylinien (in Zeichnungseinheiten, y nach oben); Transformation für Blockreferenzen
+  const raw = [], texts = [];
+  const arcPts = (cx, cy, r, a0, a1) => { let d = a1 - a0; while (d <= 0) d += Math.PI * 2; const n = Math.max(6, Math.ceil(d / (Math.PI / 18))); const out = []; for (let k = 0; k <= n; k++) { const t = a0 + d * k / n; out.push([cx + r * Math.cos(t), cy + r * Math.sin(t)]); } return out; };
+  const bulgePts = (p, q, b) => {
+    if (!b) return [q];
+    const th = 4 * Math.atan(b), dx = q[0] - p[0], dy = q[1] - p[1], ch = Math.hypot(dx, dy); if (!ch) return [q];
+    const r = ch / (2 * Math.sin(th / 2)), mx = (p[0] + q[0]) / 2, my = (p[1] + q[1]) / 2, hgt = r * Math.cos(th / 2);
+    const cx = mx - hgt * dy / ch, cy = my + hgt * dx / ch;
+    const a0 = Math.atan2(p[1] - cy, p[0] - cx); const n = Math.max(4, Math.ceil(Math.abs(th) / (Math.PI / 18))); const out = [];
+    for (let k = 1; k <= n; k++) { const t = a0 + th * k / n; out.push([cx + Math.abs(r) * Math.cos(t), cy + Math.abs(r) * Math.sin(t)]); }
+    out[out.length - 1] = q; return out;
+  };
+  // Vertex-Folgen für POLYLINE einsammeln
+  function walk(list, m, inherit, depth) {
+    if (depth > 8) return;
+    for (let i = 0; i < list.length; i++) {
+      const r = list[i];
+      if (get(r, 67) === '1') continue;                           // Papierbereich
+      if (get(r, 60) === '1') continue;                           // unsichtbar
+      let layer = get(r, 8, '0'); if (layer === '0' && inherit) layer = inherit.layer;
+      const ly = layerOf(layer); if (ly.off) continue;
+      let col = parseInt(get(r, 62, '256'), 10); if (col === 256) col = ly.color; if (col === 0 && inherit) col = inherit.color;
+      let lw = parseInt(get(r, 370, '-1'), 10); lw = lw > 0 ? lw / 100 : ly.lw;
+      const T = (x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+      const add = (subs, fill = false, curved = false) => raw.push({ layer, color: aci(col), lw, fill, curved, subs: subs.map(s => ({ pts: s.pts.map(p => T(p[0], p[1])), closed: s.closed, curved: curved || s.curved })) });
+      switch (r.type) {
+        case 'LINE': add([{ pts: [[num(r, 10), num(r, 20)], [num(r, 11), num(r, 21)]], closed: false }]); break;
+        case 'LWPOLYLINE': {
+          const closed = (parseInt(get(r, 70, '0'), 10) & 1) === 1; const vs = []; let v = null;
+          for (const [c, val] of r.g) { if (c === 10) { v = { x: +val, y: 0, b: 0 }; vs.push(v); } else if (c === 20 && v) v.y = +val; else if (c === 42 && v) v.b = +val; }
+          if (vs.length < 2) break;
+          const pts = [[vs[0].x, vs[0].y]]; let curved = false;
+          for (let k = 1; k < vs.length + (closed ? 1 : 0); k++) { const a = vs[k - 1], b = vs[k % vs.length]; if (a.b) curved = true; pts.push(...bulgePts([a.x, a.y], [b.x, b.y], a.b)); }
+          if (closed) pts.pop();
+          add([{ pts, closed, curved }], false, curved); break;
+        }
+        case 'POLYLINE': {
+          const closed = (parseInt(get(r, 70, '0'), 10) & 1) === 1; const vs = [];
+          for (i++; i < list.length && list[i].type === 'VERTEX'; i++) vs.push({ x: num(list[i], 10), y: num(list[i], 20), b: num(list[i], 42) });
+          if (vs.length < 2) break;
+          const pts = [[vs[0].x, vs[0].y]]; let curved = false;
+          for (let k = 1; k < vs.length + (closed ? 1 : 0); k++) { const a = vs[k - 1], b = vs[k % vs.length]; if (a.b) curved = true; pts.push(...bulgePts([a.x, a.y], [b.x, b.y], a.b)); }
+          if (closed) pts.pop();
+          add([{ pts, closed, curved }], false, curved); break;
+        }
+        case 'CIRCLE': add([{ pts: arcPts(num(r, 10), num(r, 20), num(r, 40), 0, Math.PI * 2).slice(0, -1), closed: true }], false, true); break;
+        case 'ARC': add([{ pts: arcPts(num(r, 10), num(r, 20), num(r, 40), num(r, 50) * Math.PI / 180, num(r, 51) * Math.PI / 180), closed: false }], false, true); break;
+        case 'ELLIPSE': {
+          const cx = num(r, 10), cy = num(r, 20), mx = num(r, 11), my = num(r, 21), ratio = num(r, 40, 1), t0 = num(r, 41, 0), t1 = num(r, 42, Math.PI * 2);
+          const ra = Math.hypot(mx, my), rot = Math.atan2(my, mx), rb = ra * ratio; let d = t1 - t0; while (d <= 0) d += Math.PI * 2;
+          const n = Math.max(8, Math.ceil(d / (Math.PI / 18))), pts = [];
+          for (let k = 0; k <= n; k++) { const t = t0 + d * k / n, x = ra * Math.cos(t), y = rb * Math.sin(t); pts.push([cx + x * Math.cos(rot) - y * Math.sin(rot), cy + x * Math.sin(rot) + y * Math.cos(rot)]); }
+          const full = Math.abs(d - Math.PI * 2) < 1e-6; if (full) pts.pop();
+          add([{ pts, closed: full }], false, true); break;
+        }
+        case 'SPLINE': {
+          const fit = [], ctl = []; let p = null, q = null;
+          for (const [c, val] of r.g) { if (c === 10) { p = [+val, 0]; ctl.push(p); } else if (c === 20 && p) p[1] = +val; else if (c === 11) { q = [+val, 0]; fit.push(q); } else if (c === 21 && q) q[1] = +val; }
+          const pts = fit.length > 1 ? fit : ctl; if (pts.length > 1) add([{ pts, closed: (parseInt(get(r, 70, '0'), 10) & 1) === 1 }], false, true); break;
+        }
+        case 'SOLID': case 'TRACE': {
+          const pts = [[num(r, 10), num(r, 20)], [num(r, 11), num(r, 21)], [num(r, 13, num(r, 12)), num(r, 23, num(r, 22))], [num(r, 12), num(r, 22)]];
+          add([{ pts, closed: true }], true); break;
+        }
+        case 'HATCH': {
+          // nur Vollflächen (Poché) übernehmen, Muster-Schraffuren sind Deko
+          if (get(r, 70) !== '1') break;
+          const subs = []; let poly = null, curP = null;
+          for (const [c, val] of r.g) {
+            if (c === 92) { poly = { pts: [], closed: true }; subs.push(poly); }
+            else if ((c === 10 || c === 11) && poly) { curP = [+val, 0]; poly.pts.push(curP); }
+            else if ((c === 20 || c === 21) && curP) curP[1] = +val;
+          }
+          const ok = subs.filter(s => s.pts.length > 2).map(s => ({ pts: s.pts.filter((pp, k) => k === 0 || pp[0] !== s.pts[k - 1][0] || pp[1] !== s.pts[k - 1][1]), closed: true }));
+          if (ok.length) add(ok, true); break;
+        }
+        case 'TEXT': case 'MTEXT': case 'ATTRIB': {
+          const x = num(r, 10), y = num(r, 20), h = num(r, 40, 2.5), s = String(get(r, 1, '')).replace(/\\[A-Za-z][^;]*;|[{}]/g, ''), n = Math.max(1, Math.min(200, s.length));
+          const p1 = T(x, y), p2 = T(x + n * h * 0.6, y + h);
+          for (let k = 0; k < n; k++) texts.push({ box: [Math.min(p1[0], p2[0]), Math.min(p1[1], p2[1]), Math.max(p1[0], p2[0]), Math.max(p1[1], p2[1])], layer });
+          break;
+        }
+        case 'INSERT': {
+          const b = blocks[get(r, 2, '')]; if (!b || /^\*[DT]/i.test(b.name)) break;   // Bemaßungs-Blöcke überspringen
+          const sx = num(r, 41, 1), sy = num(r, 42, 1), a = num(r, 50, 0) * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a);
+          const cols = Math.max(1, num(r, 70, 1)), rows = Math.max(1, num(r, 71, 1)), dc = num(r, 44, 0), dr = num(r, 45, 0);
+          for (let ci = 0; ci < cols; ci++) for (let ri = 0; ri < rows; ri++) {
+            const tx = num(r, 10) + ci * dc * c - ri * dr * sn, ty = num(r, 20) + ci * dc * sn + ri * dr * c;
+            // M_insert = T(tx,ty) · R(a) · S(sx,sy) · T(-base)
+            const n = [c * sx, sn * sx, -sn * sy, c * sy, tx - (c * sx * b.bx - sn * sy * b.by), ty - (sn * sx * b.bx + c * sy * b.by)];
+            const mm = [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+            walk(b.ents, mm, { layer, color: col }, depth + 1);
+          }
+          break;
+        }
+        default: break;   // DIMENSION, POINT, 3DFACE, IMAGE … werden nicht übernommen
+      }
+    }
+  }
+  walk(ents, [1, 0, 0, 1, 0, 0], null, 0);
+  if (!raw.length) throw new Error('In der DXF sind keine Linien im Modellbereich. Liegt die Zeichnung nur im Layout/Papierbereich?');
+
+  // Ausdehnung (Ausreißer weit weg vom Rest ignorieren: Koordinaten-Reste in vielen CAD-Dateien)
+  const xs = [], ys = []; raw.forEach(e => e.subs.forEach(s => s.pts.forEach(p => { xs.push(p[0]); ys.push(p[1]); })));
+  const qs = (a, f) => { const s = Float64Array.from(a).sort(); return s[Math.min(s.length - 1, Math.max(0, Math.floor(f * (s.length - 1))))]; };
+  const x1q = qs(xs, 0.01), x2q = qs(xs, 0.99), y1q = qs(ys, 0.01), y2q = qs(ys, 0.99), pad = Math.max(x2q - x1q, y2q - y1q) * 0.5 + 1e-9;
+  const inR = (p) => p[0] >= x1q - pad && p[0] <= x2q + pad && p[1] >= y1q - pad && p[1] <= y2q + pad;
+  const keepRaw = raw.filter(e => e.subs.every(s => s.pts.every(inR)));
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  keepRaw.forEach(e => e.subs.forEach(s => s.pts.forEach(p => { minx = Math.min(minx, p[0]); maxx = Math.max(maxx, p[0]); miny = Math.min(miny, p[1]); maxy = Math.max(maxy, p[1]); })));
+  const W = Math.max(1e-6, maxx - minx), H = Math.max(1e-6, maxy - miny);
+  // Einheit: aus dem Kopf, sonst aus der Größe raten (Gebäude sind 5–300 m groß)
+  let unitGuess = false;
+  if (!unitMm) {
+    if (DXF_UNITS[insunits]) unitMm = DXF_UNITS[insunits][1];
+    else { unitGuess = true; const ext = Math.max(W, H); unitMm = ext > 2000 ? 1 : ext > 200 ? 10 : 1000; }
+  }
+  const lwUnits = (mmPaper) => (mmPaper * 100) / unitMm;          // Linienstärke wie in einem 1:100-Plan
+  const els = keepRaw.map((e, k) => {
+    const subs = e.subs.map(s => ({ pts: s.pts.map(p => [p[0] - minx, maxy - p[1]]), closed: s.closed, curved: s.curved }));
+    const o = { id: k, subs, stroke: e.fill ? null : e.color, fill: e.fill ? e.color : null, sw: e.fill ? 0 : lwUnits(e.lw), layer: e.layer };
+    o.box = bboxOf(subs); o.len = subs.reduce((a, s) => a + plen(s.pts, s.closed), 0); o.curved = subs.some(s => s.curved);
+    return o;
+  });
+  const tx = texts.filter(t => inR([t.box[0], t.box[1]])).map(t => ({ box: [t.box[0] - minx, maxy - t.box[3], t.box[2] - minx, maxy - t.box[1]], layer: t.layer }));
+  const cnt = new Map(); els.forEach(e => cnt.set(e.layer, (cnt.get(e.layer) || 0) + 1)); tx.forEach(t => { if (!cnt.has(t.layer)) cnt.set(t.layer, 0); });
+  return { W, H, unitMm, unitGuess, insunits, els, texts: tx, ox0: minx, oy0: -maxy, dxf: true,
+    layers: [...cnt.entries()].map(([name, n]) => ({ name, n, color: hex(aci(layerOf(name).color)) })).sort((a, b) => a.name.localeCompare(b.name, 'de')) };
 }
