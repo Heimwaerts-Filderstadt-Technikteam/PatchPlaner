@@ -419,7 +419,7 @@ export function buildSVG(model, cl, { keepText = false, colors = false, margin =
     const filled = e.fill && lum(e.fill) < 0.92 && e.subs.every(s => s.closed);
     const fillC = filled ? (colors ? hex(e.fill) : (lum(e.fill) < 0.5 ? '#3c3c3c' : '#8a8a8a')) : 'none';
     const strokeC = e.stroke && e.sw > 0 ? (colors ? hex(e.stroke) : '#000') : 'none';
-    out += `<path d="${dOf(e)}" fill="${fillC}"${filled ? ' fill-rule="evenodd"' : ''} stroke="${strokeC}"${strokeC !== 'none' ? ` stroke-width="${f(Math.max(e.sw, 0.2))}"` : ''}/>`;
+    out += `<path data-k="${cl.res[k] === 'window' ? 'f' : cl.res[k] === 'detail' ? 'd' : 'w'}" d="${dOf(e)}" fill="${fillC}"${filled ? ' fill-rule="evenodd"' : ''} stroke="${strokeC}"${strokeC !== 'none' ? ` stroke-width="${f(Math.max(e.sw, 0.2))}"` : ''}/>`;
   });
   if (keepText) model.texts.forEach(t => { /* Text wird nicht nachgebaut – nur als Hinweis ausgelassen */ });
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${f(w)}" height="${f(h)}" viewBox="0 0 ${f(w)} ${f(h)}"><g stroke-linecap="round" stroke-linejoin="round">${out}</g></svg>`;

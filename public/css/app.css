@@ -485,3 +485,8 @@ table.patch tr:hover td { background: var(--sunk); cursor: pointer; }
 .vf-sw b { display: block; width: 26px; border-radius: 1px; } .vf-sw i { display: block; width: 24px; height: 14px; border-radius: 2px; }
 .vf-t { font-size: 13px; line-height: 1.25; }
 @media (max-width: 860px) { .vf { grid-template-columns: 1fr; } .vf-prev { min-height: 300px; } }
+.v3d { z-index: 70; }
+.v3d-info { position: absolute; right: 12px; top: 12px; width: 280px; display: grid; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; box-shadow: var(--shadow-sm); z-index: 2; font-size: 13px; }
+.v3i-h { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 15px; }
+.v3i-tip { margin: 0; padding: 6px 8px; border-radius: 6px; background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.v3d-info .calc td:last-child { text-align: right; white-space: nowrap; }

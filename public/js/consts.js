@@ -91,3 +91,14 @@ export function dimDefault(name) {
   for (const [re, d] of DIMS) if (re.test(name || '')) return { w: d[0], d: d[1], h: d[2] };
   return { w: 40, d: 30, h: 15 };
 }
+
+/* Übliche Montagehöhe (Unterkante über dem Fußboden, m) – Schätzwerte nach Gerätename */
+const MOUNTS = [
+  [/sub|monitor.?box|wedge|bühnenmonitor|stagebox|multicore|rack|di-?box|mehrfach|steckdosen|usv|stromverteiler/i, 0],
+  [/line.?array/i, 6], [/lautsprecher|speaker|\bbox\b|topteil/i, 2.2],
+  [/ptz/i, 2.5], [/beamer|projektor/i, 2.8], [/moving|par|spot|scheinwerfer|fluter|led-?bar/i, 4],
+  [/studiokamera|kamera|camera|camcorder/i, 1.4], [/handheld|funksender|mikrofon|\bmic\b/i, 1.4], [/beltpack|taschensender|in-?ear/i, 1.0],
+  [/fernseher|display|\btv\b/i, 1.2], [/wandsteckdose/i, 0.3],
+  [/mischpult|mixer|konsole|monitor|laptop|notebook|tablet|computer|\bpc\b|lichtpult|dimmer|bildmischer|recorder|encoder|interface|empfänger|receiver|intercom|switch|router|kreuzschiene|wandler/i, 0.75],
+];
+export function mountDefault(name) { for (const [re, v] of MOUNTS) if (re.test(name || '')) return v; return 0; }

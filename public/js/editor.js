@@ -1,6 +1,6 @@
 // PatchPlaner Plan-Editor
 import { api, clientId, ApiError } from './api.js';
-import { U, TYPES, FT_LENS, typeOf, DIRS, COLORS, COLNAMES, SYMS, SHAPES, CATCOL, units, toUser, fromUser, uName, fmtLen, fmtNum, M_PER_FT, dimDefault } from './consts.js';
+import { U, TYPES, FT_LENS, typeOf, DIRS, COLORS, COLNAMES, SYMS, SHAPES, CATCOL, units, toUser, fromUser, uName, fmtLen, fmtNum, M_PER_FT, dimDefault, mountDefault } from './consts.js';
 import { $, $$, esc, trunc, uid, clamp, toast, modal, armButton, copyText, download, relTime, fmtDate, initials, avatarColor, debounce } from './ui.js';
 import { layout, anchorOf, itemInner, clearLayoutCache, itemPreviewSVG, textOn } from './itemsvg.js';
 import { routeOrtho, simplify, pathWithHops, segmentsOf } from './routing.js';
@@ -46,13 +46,13 @@ export async function openEditor(root, opts) {
       strict: d.strict ?? false, hops: d.hops ?? true, packZones: d.packZones ?? false,
       floors: Array.isArray(d.floors) ? d.floors : [], items: Array.isArray(d.items) ? d.items : [], cables: Array.isArray(d.cables) ? d.cables : [],
       shapes: Array.isArray(d.shapes) ? d.shapes : [], extras: Array.isArray(d.extras) ? d.extras : [],
-      settings: { endSlack: userSettings.endSlack ?? 1, heightAdd: 0, reserve: userSettings.reserve ?? 10, roundUp: userSettings.roundUp ?? true, route: 'auto', ...(d.settings || {}) },
+      settings: { endSlack: userSettings.endSlack ?? 1, heightAdd: 0, reserve: userSettings.reserve ?? 10, roundUp: userSettings.roundUp ?? true, route: 'auto', rz: 'floor', vert: true, ...(d.settings || {}) },
     };
     s.items.forEach(it => { it.ports = it.ports || []; it.elements = it.elements || []; it.ports.forEach(p => { p.id = p.id || uid(); }); });
     s.cables.forEach(c => { c.wps = c.wps || []; c.extra = c.extra || 0; });
     // Ebenen (UG, EG, Empore …): jedes Gerät, jede Form und jeder Grundriss gehört zu genau einer Ebene
     const lv = Array.isArray(d.levels) && d.levels.length ? d.levels : [{ id: uid(), name: 'EG', elev: 0 }];
-    s.levels = lv.map(l => ({ id: l.id || uid(), name: String(l.name || 'Ebene'), elev: Number.isFinite(+l.elev) ? +l.elev : 0, scale: +l.scale > 0 ? +l.scale : null }));
+    s.levels = lv.map(l => ({ id: l.id || uid(), name: String(l.name || 'Ebene'), elev: Number.isFinite(+l.elev) ? +l.elev : 0, scale: +l.scale > 0 ? +l.scale : null, height: +l.height > 0 ? +l.height : 3 }));
     const lvIds = new Set(s.levels.map(l => l.id));
     for (const o of [...s.items, ...s.shapes, ...s.floors]) if (!lvIds.has(o.lv)) o.lv = s.levels[0].id;
     s.packLevels = d.packLevels ?? true;
@@ -174,6 +174,27 @@ export async function openEditor(root, opts) {
   }
   ensureLv();
   const isCross = (c) => { const a = itemById(c.from.item), b = itemById(c.to.item); return !!(a && b && a.lv !== b.lv); };
+  /* Höhen: Ebene (Fußboden + Raumhöhe), Bereich (Podest + Raumhöhe), Gerät (Montagehöhe), Kabelweg (Boden/Decke/fest) */
+  const lvH = (lv) => lvById(lv).height || 3;
+  const mountOf = (it) => (it.mz != null && it.mz !== '' && isFinite(+it.mz) ? +it.mz : mountDefault(it.name));
+  function baseOf(it) {
+    const l = lvById(it.lv), z = zoneOf(center(it), it.lv), zf = z && +z.zf ? +z.zf : 0;
+    return { floor: l.elev + zf, ceil: l.elev + (z && +z.zh > 0 ? zf + +z.zh : lvH(it.lv)), zone: z };
+  }
+  const devZ = (it) => baseOf(it).floor + mountOf(it) + (dimOf(it).h || 30) / 200;   // Anschluss: Mitte des Geräts
+  const rzMode = (c) => (c.rz != null && c.rz !== '' ? c.rz : S.settings.rz || 'floor');
+  function routeZ(c, it) {
+    const m = rzMode(c), b = baseOf(it);
+    if (m === 'ceil') return b.ceil;
+    if (m === 'floor') return b.floor;
+    return isFinite(+m) ? lvById(it.lv).elev + +m : b.floor;
+  }
+  function vertOf(c) {
+    const a = itemById(c.from.item), b = itemById(c.to.item); if (!a || !b) return null;
+    const zA = devZ(a), zB = devZ(b), rA = routeZ(c, a), rB = routeZ(c, b);
+    return { zA, zB, rA, rB, upA: Math.abs(zA - rA), riser: Math.abs(rA - rB), upB: Math.abs(rB - zB) };
+  }
+  const rzName = (m) => (m === 'ceil' ? 'an der Decke' : m === 'floor' || m == null ? 'am Boden' : `in ${fmtLen(+m, 2)} Höhe`);
   const lvDiff = (c) => { const a = itemById(c.from.item), b = itemById(c.to.item); return a && b && a.lv !== b.lv ? Math.abs(lvById(a.lv).elev - lvById(b.lv).elev) : 0; };
   // nächste Ebene unter der aktuellen (für die blasse Grundriss-Einblendung)
   function lvBelow(id) { const cur = lvById(id); const lower = S.levels.filter(l => l.elev < cur.elev).sort((a, b) => b.elev - a.elev)[0]; return lower || S.levels.filter(l => l.id !== id).sort((a, b) => a.elev - b.elev)[0] || null; }
@@ -332,10 +353,11 @@ export async function openEditor(root, opts) {
   function calc(c, pts) {
     pts = pts || cablePts(c); if (!pts) return null; const s = S.settings;
     if (typeOf(c.type).nocable) return { pts, geo: polyLen(pts) / U, slack: 0, height: 0, extra: 0, reserve: 0, total: 0, final: 0, pack: { len: 0 }, nocable: true };
-    const geo = polyLen(pts) / U, slack = 2 * (+s.endSlack || 0), height = +s.heightAdd || 0, extra = +c.extra || 0, lvh = lvDiff(c);
-    const sub = geo + slack + height + extra + lvh, reserve = sub * ((+s.reserve || 0) / 100), total = sub + reserve;
+    const V = s.vert !== false ? vertOf(c) : null;
+    const geo = polyLen(pts) / U, slack = 2 * (+s.endSlack || 0), height = +s.heightAdd || 0, extra = +c.extra || 0, lvh = V ? 0 : lvDiff(c), vert = V ? V.upA + V.riser + V.upB : 0;
+    const sub = geo + slack + height + extra + lvh + vert, reserve = sub * ((+s.reserve || 0) / 100), total = sub + reserve;
     const final = c.override > 0 ? +c.override : total;
-    return { pts, geo, slack, height, extra, lvh, reserve, total, final, pack: packLen(c.type, final) };
+    return { pts, geo, slack, height, extra, lvh, vert, V, reserve, total, final, pack: packLen(c.type, final) };
   }
   function cableIds() { const cnt = {}, ids = {}; S.cables.forEach(c => { const t = typeOf(c.type); cnt[c.type] = (cnt[c.type] || 0) + 1; ids[c.id] = c.label || (t.short + ' ' + String(cnt[c.type]).padStart(2, '0')); }); return ids; }
   function adaptersOf(c) {
@@ -684,7 +706,7 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     changed();
   }
   // Maßstäblich sind die Ports nicht sichtbar: nach dem Ziehen wählt man sie hier
-  function openPortPicker(aId, bId) {
+  function openPortPicker(aId, bId, onDone) {
     let A = itemById(aId), B = itemById(bId); if (!A || !B) return;
     const cm = connMap(), free = (it, p) => !cm.has(it.id + '/' + p.id);
     const outs = (it) => it.ports.filter(p => p.dir !== 'in'), ins = (it) => it.ports.filter(p => p.dir !== 'out');
@@ -700,11 +722,11 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
         <div><h3>${esc(itemName(B))}<span class="small muted"> · Eingang</span></h3><div class="pp-list">${li.map(p => row(B, p, 'ppB', pb)).join('') || '<p class="hint">Keine Eingänge.</p>'}</div></div>
       </div><button class="btn sm" id="ppSwap">Richtung tauschen</button></div>
       <footer><button class="btn" data-x>Abbrechen</button><button class="btn pri" id="ppGo">Verbinden</button></footer>`);
-    m.el.querySelector('#ppSwap').onclick = () => { m.close(); openPortPicker(B.id, A.id); };
+    m.el.querySelector('#ppSwap').onclick = () => { m.close(); openPortPicker(B.id, A.id, onDone); };
     m.el.querySelector('#ppGo').onclick = () => {
       const a = m.el.querySelector('input[name=ppA]:checked'), b = m.el.querySelector('input[name=ppB]:checked');
       if (!a || !b) { toast('Wähle auf beiden Seiten einen freien Port.'); return; }
-      m.close(); connect({ item: A.id, port: a.value }, { item: B.id, port: b.value });
+      m.close(); connect({ item: A.id, port: a.value }, { item: B.id, port: b.value }); onDone && onDone();
     };
   }
   function setReal(on, quiet) {
@@ -1052,7 +1074,7 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     const sug = ['UG', 'EG', 'OG', 'Empore', '1. OG', '2. OG', 'Dach'].find(n => !names.includes(n)) || `Ebene ${S.levels.length + 1}`;
     const elev = sug === 'UG' ? Math.min(...S.levels.map(l => l.elev)) - 3 : Math.max(...S.levels.map(l => l.elev)) + 3.5;
     pushUndo();
-    const l = { id: uid(), name: sug, elev: Math.round(elev * 10) / 10, scale: (S.levels.find(x => x.scale) || {}).scale || null };
+    const l = { id: uid(), name: sug, height: 3, elev: Math.round(elev * 10) / 10, scale: (S.levels.find(x => x.scale) || {}).scale || null };
     S.levels.push(l); markDirty(); renamingLv = l.id; freshLv = l.id; switchLevel(l.id, true); changed();
   }
   // Höhe einer frisch angelegten Ebene aus ihrem Namen ableiten (Keller/UG nach unten, alles andere nach oben)
@@ -1578,6 +1600,7 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
       ${field('iInv', 'Geräte-ID', it.inv, 'text', 'placeholder="Inventar-Nr., optional" maxlength="60"')}
       <label class="row"><span>Farbe</span><input type="color" id="iColor" value="${esc(it.color)}"></label>
       <label class="row"><span>Notiz</span><input class="inp" id="iNotes" value="${esc(it.notes || '')}" placeholder="z. B. auf Stativ, 1,80 m"></label>
+      <label class="row"><span>Höhe über Boden (${uName()})</span><span class="inline"><input class="inp sm" id="iMz" inputmode="decimal" value="${it.mz != null && it.mz !== '' ? +toUser(+it.mz).toFixed(2) : ''}" placeholder="${fmtNum(toUser(mountDefault(it.name)), 2)}" style="width:80px" ${readonly ? 'disabled' : ''}><span class="small muted" title="Anschlusshöhe über dem Fußboden der Ebene">Anschluss ${fmtNum(toUser(devZ(it) - lvById(it.lv).elev), 2)} ${uName()}${baseOf(it).zone && baseOf(it).zone.zf ? ' (auf Podest)' : ''}</span></span></label>
       <div class="row"><span>Maße (cm)</span><span class="inline dims"><input class="inp sm" id="iDw" inputmode="decimal" value="${fmtNum(dimOf(it).w, 0)}" aria-label="Breite in cm" ${readonly ? 'disabled' : ''}>×<input class="inp sm" id="iDd" inputmode="decimal" value="${fmtNum(dimOf(it).d, 0)}" aria-label="Tiefe in cm" ${readonly ? 'disabled' : ''}>×<input class="inp sm" id="iDh" inputmode="decimal" value="${fmtNum(dimOf(it).h || 0, 0)}" aria-label="Höhe in cm" ${readonly ? 'disabled' : ''}></span></div>
       ${S.real && !readonly ? `<div class="row"><span>Drehung</span><span class="inline"><span class="chip">${it.rot || 0}°</span><button class="btn sm" data-a="rot" title="Um 90° drehen (R)">↻ 90°</button></span></div>` : ''}
       ${readonly ? '' : `<div class="btnrow"><button class="btn" data-a="edit">Ports bearbeiten</button><button class="btn" data-a="dup">Duplizieren</button><button class="btn" data-a="savegear">${it.gear ? 'Als neues Gerät speichern' : 'In meinen Geräten speichern'}</button>${it.gear ? '<button class="btn" data-a="syncgear">Aus Bibliothek aktualisieren</button>' : ''}<button class="btn bad" data-a="del">Löschen</button></div>`}
@@ -1595,6 +1618,7 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
       <div class="row"><span>Farbe</span>${sw}</div>
       ${s.kind !== 'line' && s.kind !== 'arrow' ? `<div class="row"><span>${s.kind === 'text' ? 'Hintergrund' : 'Füllung'}</span><div class="seg">${[['none', 'Keine'], ['tint', 'Getönt'], ['solid', 'Voll']].map(([k, n]) => `<button data-sfill="${k}" class="${s.fill === k ? 'on' : ''}">${n}</button>`).join('')}</div></div>` : ''}
       ${s.kind !== 'text' ? `<div class="row"><span>Linie</span><div class="seg">${[[1, 'Dünn'], [2, 'Normal'], [3, 'Fett']].map(([k, n]) => `<button data-swt="${k}" class="${(s.weight || 2) == k ? 'on' : ''}">${n}</button>`).join('')}</div></div>` : ''}
+      ${s.kind === 'zone' ? `${field('shZf', `Bodenhöhe / Podest (${uName()})`, s.zf ? +toUser(s.zf).toFixed(2) : '', 'text', 'inputmode="decimal" placeholder="0 = Fußboden der Ebene"')}${field('shZh', `Raumhöhe (${uName()})`, s.zh ? +toUser(s.zh).toFixed(2) : '', 'text', `inputmode="decimal" placeholder="wie Ebene (${fmtNum(toUser(lvH(s.lv)), 2)})"`)}<p class="hint small">Geräte in diesem Bereich stehen auf dem Podest; „Decke“ als Kabelweg nutzt die Raumhöhe des Bereichs.</p>` : ''}
       ${!['zone', 'line', 'arrow', 'text'].includes(s.kind) ? `<label class="row"><span>Drehung</span><span class="inline"><input type="range" id="shRot" min="0" max="359" value="${s.rot || 0}"><span class="mono small" style="width:4ch">${s.rot || 0}°</span></span></label>` : ''}
       ${s.kind === 'line' || s.kind === 'arrow' ? `<p class="hint">Länge: <b>${fmtLen(Math.hypot(s.w, s.h) / U, 2)}</b></p>` : !['text', 'sym'].includes(s.kind) ? `<p class="hint">Maße: <b>${fmtNum(toUser(s.w / U), 2)} × ${fmtLen(s.h / U, 2)}</b>${s.kind === 'zone' || s.kind === 'rect' ? ` · Fläche ${fmtNum(toUser(s.w / U) * toUser(s.h / U), 1)} ${uName()}²` : ''}</p>` : ''}
       ${readonly ? '' : `<div class="btnrow">${s.kind === 'zone' ? '<button class="btn" data-a="zoomzone">Auf Zone zoomen</button>' : ''}<button class="btn" data-a="dup">Duplizieren</button><button class="btn" data-a="front">Nach vorne</button><button class="btn" data-a="back">Nach hinten</button><button class="btn bad" data-a="del">Löschen</button></div>`}
@@ -1610,11 +1634,13 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     const uncal = S.floors.length && !S.floors.some(f => f.calibrated);
     return `<div class="sec"><h3>Kabel <span class="chip"><span class="dot" style="background:${typeOf(c.type).color}"></span>${esc(ids[c.id])}</span></h3>
       <div class="box small"><div><span class="muted">Von</span> <b>${esc(itemName(a))}</b> · ${esc(pa.name)} <span class="muted">(${DIRS[pa.dir]}${S.levels.length > 1 ? ' · ' + esc(lvById(a.lv).name) : ''})</span></div><div><span class="muted">${isBi(c) ? '⇄' : '→'} Nach</span> <b>${esc(itemName(b))}</b> · ${esc(pb.name)} <span class="muted">(${DIRS[pb.dir]}${S.levels.length > 1 ? ' · ' + esc(lvById(b.lv).name) : ''})</span></div></div>
-      ${isCross(c) ? `<div class="box small">Kabel zwischen zwei Ebenen. Der Höhenunterschied (${fmtLen(r.lvh || 0, 2)}) wird automatisch addiert. Die Steigleitung liegt am ↕-Punkt.</div>` : ''}
+      ${isCross(c) ? `<div class="box small">Kabel zwischen zwei Ebenen. ${r.V ? `Die Steigleitung (${fmtLen(r.V.riser, 2)})` : `Der Höhenunterschied (${fmtLen(r.lvh || 0, 2)})`} wird automatisch addiert. Sie liegt am ↕-Punkt.</div>` : ''}
       ${ad.length ? `<div class="warnbox">Adapter nötig: <b>${ad.map(esc).join(', ')}</b>. Er steht automatisch in der Packliste.</div>` : ''}
       <label class="row"><span>Kabeltyp</span><select class="inp" id="cType">${typeOptions(c.type)}</select></label>
       ${field('cLabel', 'Kabel-ID', c.label || '', 'text', `placeholder="${esc(ids[c.id])}" maxlength="40"`)}
       ${field('cNotes', 'Notiz', c.notes || '', 'text', 'placeholder="z. B. über Traverse"')}
+      ${S.settings.vert !== false ? `<label class="row"><span>Kabelweg</span><select class="inp" id="cRz" ${readonly ? 'disabled' : ''}><option value=""${c.rz == null || c.rz === '' ? ' selected' : ''}>wie im Plan (${esc(rzName(S.settings.rz))})</option><option value="floor"${c.rz === 'floor' ? ' selected' : ''}>am Boden</option><option value="ceil"${c.rz === 'ceil' ? ' selected' : ''}>an der Decke</option><option value="custom"${c.rz != null && c.rz !== '' && isFinite(+c.rz) ? ' selected' : ''}>in fester Höhe …</option></select></label>
+      ${c.rz != null && c.rz !== '' && isFinite(+c.rz) ? field('cRzN', `Höhe über Fußboden (${uName()})`, +toUser(+c.rz).toFixed(2), 'text', 'inputmode="decimal"') : ''}` : ''}
       ${readonly ? '' : `<div class="row"><span>Verlegung</span><div class="seg"><button data-route="auto" class="${route === 'auto' ? 'on' : ''}" title="Automatisch um Geräte herum">Auto</button><button data-route="ortho" class="${route === 'ortho' ? 'on' : ''}" title="Einfacher Winkel">Winkel</button><button data-route="direct" class="${route === 'direct' ? 'on' : ''}">Direkt</button><button class="${route === 'pins' ? 'on' : ''}" data-a="pinhint">Pins${c.wps.length ? ' (' + c.wps.length + ')' : ''}</button></div></div>
       ${c.wps.length ? '<button class="btn sm" data-a="clearpins">Pins entfernen, automatisch verlegen</button>' : '<p class="hint small">Doppelklick aufs Kabel setzt einen Pin. Danach bleibt die Führung manuell.</p>'}`}
     </div>
@@ -1625,6 +1651,9 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
         <tr><td>Zuschlag Enden (2 × ${fmtLen(s.endSlack, 1)})</td><td>+ ${fmtLen(r.slack, 2)}</td></tr>
         ${r.height ? `<tr><td>Höhenzuschlag</td><td>+ ${fmtLen(r.height, 2)}</td></tr>` : ''}
         ${r.lvh ? `<tr><td>Höhenunterschied ${esc(lvById(a.lv).name)} ↕ ${esc(lvById(b.lv).name)}</td><td>+ ${fmtLen(r.lvh, 2)}</td></tr>` : ''}
+        ${r.V && r.V.upA > 0.005 ? `<tr><td>Senkrecht bei ${esc(itemName(a))} <span class="muted">(${fmtNum(toUser(r.V.zA - lvById(a.lv).elev), 2)} ↔ ${fmtNum(toUser(r.V.rA - lvById(a.lv).elev), 2)} ${uName()})</span></td><td>+ ${fmtLen(r.V.upA, 2)}</td></tr>` : ''}
+        ${r.V && r.V.riser > 0.005 ? `<tr><td>${isCross(c) ? `Steigleitung ${esc(lvById(a.lv).name)} ↕ ${esc(lvById(b.lv).name)}` : 'Höhenwechsel im Kabelweg'}</td><td>+ ${fmtLen(r.V.riser, 2)}</td></tr>` : ''}
+        ${r.V && r.V.upB > 0.005 ? `<tr><td>Senkrecht bei ${esc(itemName(b))} <span class="muted">(${fmtNum(toUser(r.V.rB - lvById(b.lv).elev), 2)} ↔ ${fmtNum(toUser(r.V.zB - lvById(b.lv).elev), 2)} ${uName()})</span></td><td>+ ${fmtLen(r.V.upB, 2)}</td></tr>` : ''}
         ${r.extra ? `<tr><td>Zusatzlänge dieses Kabels</td><td>+ ${fmtLen(r.extra, 2)}</td></tr>` : ''}
         <tr><td>Reserve ${(+s.reserve).toLocaleString('de-DE')} %</td><td>+ ${fmtLen(r.reserve, 2)}</td></tr>
         <tr class="tot"><td>Berechnet</td><td>${fmtLen(r.total, 2)}</td></tr>
@@ -1653,11 +1682,12 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
       <div class="lvlist">${lvSorted().map(l => { const fl = S.floors.filter(f => f.lv === l.id); const n = S.items.filter(o => o.lv === l.id).length; return `<div class="lvrow${l.id === curLv ? ' on' : ''}">
         <div class="inline"><input class="inp sm" data-lvn="${l.id}" value="${esc(l.name)}" maxlength="24" aria-label="Name der Ebene" ${readonly ? 'disabled' : ''}>
           <span class="inline small muted lvh"><input class="inp sm" data-lve="${l.id}" value="${fmtNum(toUser(l.elev), 2).replace(/,00$/, '')}" inputmode="decimal" aria-label="Höhe der Ebene" style="width:64px" ${readonly ? 'disabled' : ''}>${uName()}</span>
+          <span class="inline small muted lvh" title="Raumhöhe (Fußboden bis Decke)">↕<input class="inp sm" data-lvhh="${l.id}" value="${fmtNum(toUser(l.height || 3), 2).replace(/,00$/, '')}" inputmode="decimal" aria-label="Raumhöhe der Ebene" style="width:52px" ${readonly ? 'disabled' : ''}></span>
           <span class="inline small muted lvh" title="Maßstab der Zeichnung">1:<input class="inp sm" data-lvs="${l.id}" type="number" min="1" step="1" value="${l.scale || ''}" placeholder="100" aria-label="Maßstab der Ebene" style="width:64px" ${readonly ? 'disabled' : ''}></span></div>
         <div class="small muted">${n} Gerät${n === 1 ? '' : 'e'} · ${fl.length ? `Grundriss: ${esc(fl.map(f => f.name).join(', '))}` : 'kein Grundriss'}</div>
         <div class="btnrow">${l.id === curLv ? '<span class="chip acc">angezeigt</span>' : `<button class="btn sm" data-lvgo="${l.id}">Anzeigen</button>`}${readonly ? '' : `<button class="btn sm${fl.length ? '' : ' pri'}" data-lvfloor="${l.id}">${fl.length ? 'Grundriss ersetzen' : 'Grundriss zuweisen'}</button>${S.levels.length > 1 ? `<button class="btn sm bad" data-lvdel="${l.id}">Löschen</button>` : ''}`}</div>
       </div>`; }).join('')}</div>
-      <p class="hint small">Die Höhe ist die Fußbodenhöhe der Ebene (EG = 0), „1:“ der Maßstab der Zeichnung (steht im Plankopf, meist 1:100 oder 1:50). Kabel zwischen Ebenen bekommen den Höhenunterschied automatisch dazu. Ebenen wechselst du oben über der Planfläche oder mit Bild ↑/↓.</p>
+      <p class="hint small">Die erste Zahl ist die Fußbodenhöhe der Ebene (EG = 0), „↕“ die Raumhöhe bis zur Decke, „1:“ der Maßstab der Zeichnung (steht im Plankopf, meist 1:100 oder 1:50). Kabel zwischen Ebenen bekommen den Höhenunterschied automatisch dazu. Ebenen wechselst du oben über der Planfläche oder mit Bild ↑/↓.</p>
     </div>
     <div class="sec"><h3>Grundriss – ${esc(lvById(curLv).name)} ${readonly ? '' : '<button class="btn sm" data-a="addFloor">+ Laden</button>'}</h3>
       ${S.floors.filter(onLv).length ? S.floors.filter(onLv).map(f => `<div class="floorrow">
@@ -1674,8 +1704,11 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
       <label class="row"><span>Höhenzuschlag</span><span class="inline"><input class="inp" id="sHeight" inputmode="decimal" value="${+toUser(s.heightAdd).toFixed(2)}"><span class="small muted">${uName()}/Kabel</span></span></label>
       <label class="row"><span>Reserve</span><span class="inline"><input class="inp" id="sRes" inputmode="decimal" value="${s.reserve}"><span class="small muted">%</span></span></label>
       <label class="chk"><input type="checkbox" id="sRound"${s.roundUp ? ' checked' : ''}> Auf Standardlängen aufrunden</label>
+      <label class="chk"><input type="checkbox" id="sVert"${s.vert !== false ? ' checked' : ''}> Senkrechte Wege einrechnen (Montagehöhe der Geräte, Kabelweg, Steigleitungen)</label>
+      ${s.vert !== false ? `<label class="row"><span>Kabelweg</span><select class="inp" id="sRz"><option value="floor"${s.rz === 'floor' || !s.rz ? ' selected' : ''}>am Boden</option><option value="ceil"${s.rz === 'ceil' ? ' selected' : ''}>an der Decke</option><option value="custom"${isFinite(+s.rz) && s.rz !== '' && s.rz != null && s.rz !== 'floor' && s.rz !== 'ceil' ? ' selected' : ''}>in fester Höhe …</option></select></label>
+      ${isFinite(+s.rz) && s.rz !== '' && s.rz != null ? `<label class="row"><span>Höhe des Kabelwegs</span><span class="inline"><input class="inp" id="sRzN" inputmode="decimal" value="${+toUser(+s.rz).toFixed(2)}"><span class="small muted">${uName()} über Fußboden</span></span></label>` : ''}` : ''}
       <div class="row"><span>Verlegung</span><div class="seg"><button data-sroute="auto" class="${s.route === 'auto' ? 'on' : ''}">Auto</button><button data-sroute="ortho" class="${s.route === 'ortho' ? 'on' : ''}">Winkel</button><button data-sroute="direct" class="${s.route === 'direct' ? 'on' : ''}">Direkt</button></div></div>
-      <p class="hint small">Länge = Weg auf dem Plan (inkl. Pins) + 2 × Endzuschlag + Höhenzuschlag (z. B. Decke hoch und wieder runter) + Zusatzlänge des Kabels + Reserve. Danach auf die nächste lieferbare Länge des Kabeltyps aufgerundet.</p>
+      <p class="hint small">Länge = Weg auf dem Plan (inkl. Pins) + senkrechte Stücke (Gerät ↔ Kabelweg an beiden Enden, Steigleitung zwischen Ebenen) + 2 × Endzuschlag + Höhenzuschlag + Zusatzlänge des Kabels + Reserve. Danach auf die nächste lieferbare Länge des Kabeltyps aufgerundet.</p>
     </div>
     <div class="sec"><h3>Darstellung</h3>
       <div class="row"><span>Ausrichtung</span><div class="seg"><button data-orient="tb" class="${S.orient === 'tb' ? 'on' : ''}">Oben → Unten</button><button data-orient="ltr" class="${S.orient === 'ltr' ? 'on' : ''}">Links → Rechts</button></div></div>
@@ -1753,7 +1786,12 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     const t = e.target, id = t.id, one = [...sel.ids][0], it = itemById(one), s = shapeById(one), c = cableById(sel.cable);
     const set = (o, k, v) => { editStart(); o[k] = v; render(); markDirty(); };
     if (it) { if (id === 'iLabel') set(it, 'label', t.value); if (id === 'iName') set(it, 'name', t.value); if (id === 'iInv') set(it, 'inv', t.value); if (id === 'iNotes') set(it, 'notes', t.value); if (id === 'iColor') set(it, 'color', t.value);
+      if (id === 'iMz') { editStart(); it.mz = t.value.trim() === '' ? null : Math.max(-50, Math.min(100, fromUser(num(t.value)))); routeCache.clear(); render(); markDirty(); }
       if (['iDw', 'iDd', 'iDh'].includes(id)) { const v = num(t.value); if (v > 0) { const c = center(it); const d = { ...dimOf(it) }; d[{ iDw: 'w', iDd: 'd', iDh: 'h' }[id]] = Math.min(5000, v); editStart(); it.dim = d; if (S.real) { const b = itemBox(it); it.x = c.x - b.w / 2; it.y = c.y - b.h / 2; routeCache.clear(); } render(); markDirty(); } } }
+    if (s && (id === 'shZf' || id === 'shZh')) { const v = t.value.trim() === '' ? null : Math.max(0, fromUser(num(t.value))); set(s, id === 'shZf' ? 'zf' : 'zh', v || null); }
+    if (c && id === 'cRzN') { const v = num(t.value); if (t.value.trim() !== '' && isFinite(v)) set(c, 'rz', fromUser(v)); }
+    if (id === 'sRzN') { const v = num(t.value); if (t.value.trim() !== '' && isFinite(v)) set(S.settings, 'rz', fromUser(v)); }
+    if (t.dataset.lvhh) { const l = S.levels.find(x => x.id === t.dataset.lvhh), v = num(t.value); if (l && v > 0) set(l, 'height', fromUser(v)); }
     if (s) { if (id === 'shLabel') set(s, 'label', t.value); if (id === 'shText') set(s, 'text', t.value); if (id === 'shSize') set(s, 'size', +t.value); if (id === 'shRot') { set(s, 'rot', +t.value); t.nextElementSibling.textContent = t.value + '°'; } }
     if (c) { if (id === 'cLabel') set(c, 'label', t.value.trim()); if (id === 'cNotes') set(c, 'notes', t.value); if (id === 'cOverride') set(c, 'override', t.value.trim() ? fromUser(num(t.value)) : null); if (id === 'cExtra') set(c, 'extra', t.value.trim() ? fromUser(num(t.value)) : 0); }
     if (id === 'mJob') setMeta('job_id', t.value); if (id === 'mVenue') setMeta('venue', t.value);
@@ -1779,6 +1817,9 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     if (t.dataset.fvis) { pushUndo(); floorById(t.dataset.fvis).visible = t.checked; changed(); }
     if (t.dataset.finv) { pushUndo(); floorById(t.dataset.finv).invert = t.checked; changed(); }
     if (id === 'sRound') { pushUndo(); S.settings.roundUp = t.checked; changed(); }
+    if (id === 'sVert') { pushUndo(); S.settings.vert = t.checked; changed(); renderPane(); }
+    if (id === 'sRz') { pushUndo(); S.settings.rz = t.value === 'custom' ? 2.5 : t.value; changed(); renderPane(); }
+    if (id === 'cRz' && c) { pushUndo(); c.rz = t.value === 'custom' ? 2.5 : (t.value || null); changed(); renderPane(); }
     if (id === 'pHops') { S.hops = t.checked; changed(); }
     if (id === 'pStrict') { S.strict = t.checked; changed(); }
     if (id === 'pkZones') { S.packZones = t.checked; changed(); }
@@ -1786,7 +1827,7 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
     if (id === 'iLv') { const it2 = itemById([...sel.ids][0]); if (it2) moveToLevel([it2.id], t.value); }
     if (id === 'shLv') { const s2 = shapeById([...sel.ids][0]); if (s2) moveToLevel([s2.id], t.value); }
     if (id === 'shBold' && s) { pushUndo(); s.bold = t.checked; changed(); }
-    if (['sSlack', 'sHeight', 'sRes', 'cOverride', 'cExtra', 'pDs'].includes(id) || t.dataset.fop) renderPane();
+    if (['sSlack', 'sHeight', 'sRes', 'cOverride', 'cExtra', 'pDs', 'iMz', 'shZf', 'shZh', 'cRzN', 'sRzN'].includes(id) || t.dataset.fop || t.dataset.lvhh) renderPane();
   });
   on(pane, 'keydown', (e) => {
     if (e.key === 'Enter' && e.target.id === 'exName') { const v = e.target.value.trim(); if (!v) return; pushUndo(); S.extras.push({ id: uid(), name: v, qty: Math.max(1, +$('#exQty', E).value || 1) }); changed(); setTimeout(() => $('#exName', E)?.focus(), 0); }
@@ -2043,19 +2084,40 @@ ${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.
 
   /* ---------- 3D ---------- */
   function scene3D() {
+    const ids = cableIds();
     return {
       U, cur: curLv, dark: document.documentElement.dataset.theme === 'dark' || (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches),
-      levels: S.levels.map(l => ({ id: l.id, name: l.name, elev: l.elev })),
-      floors: S.floors.filter(f => f.visible !== false && assets.get(f.asset)).map(f => { const a = assets.get(f.asset); return { lv: f.lv, url: assetUrl(f.asset), x: f.x, y: f.y, w: f.w, h: f.h, crop: cropOf(f), aw: a.w, ah: a.h, opacity: f.opacity ?? 0.9 }; }),
-      items: S.items.map(it => { const b = itemBox(it), d = dimOf(it), r = it.rot === 90 || it.rot === 270; return { id: it.id, lv: it.lv, x: b.x, y: b.y, w: b.w, h: b.h, color: it.color, name: itemName(it), real: { w: (r ? d.d : d.w) / 100, d: (r ? d.w : d.d) / 100, h: (d.h || 30) / 100 } }; }),
-      cables: S.cables.map(c => { const pts = cablePts(c), a = itemById(c.from.item), b = itemById(c.to.item); return pts && a && b ? { pts, from: a.id, to: b.id, lvA: a.lv, lvB: b.lv, color: typeOf(c.type).color, radio: !!typeOf(c.type).nocable } : null; }).filter(Boolean),
-      zones: S.shapes.filter(s => s.kind === 'zone').map(z => ({ lv: z.lv, x: z.x, y: z.y, w: z.w, h: z.h, color: COLORS[z.color] || z.color || COLORS.blue, label: z.label || '' })),
+      readonly, unit: uName(), vert: S.settings.vert !== false,
+      levels: S.levels.map(l => ({ id: l.id, name: l.name, elev: l.elev, height: l.height || 3 })),
+      floors: S.floors.filter(f => f.visible !== false && assets.get(f.asset)).map(f => { const a = assets.get(f.asset); return { id: f.id, lv: f.lv, url: assetUrl(f.asset), vector: !!f.vector, x: f.x, y: f.y, w: f.w, h: f.h, crop: cropOf(f), aw: a.w, ah: a.h, opacity: f.opacity ?? 0.9 }; }),
+      items: S.items.map(it => {
+        const b = itemBox(it), d = dimOf(it), r = it.rot === 90 || it.rot === 270, bs = baseOf(it);
+        return { id: it.id, lv: it.lv, x: b.x, y: b.y, w: b.w, h: b.h, color: it.color, name: itemName(it), floor: bs.floor, mount: mountOf(it), mountSet: it.mz != null && it.mz !== '', z: bs.floor + mountOf(it),
+          real: { w: (r ? d.d : d.w) / 100, d: (r ? d.w : d.d) / 100, h: (d.h || 30) / 100 }, ports: it.ports.length, used: it.ports.filter(p => S.cables.some(c => (c.from.item === it.id && c.from.port === p.id) || (c.to.item === it.id && c.to.port === p.id))).length };
+      }),
+      cables: S.cables.map(c => {
+        const r = calc(c), a = itemById(c.from.item), b = itemById(c.to.item); if (!r || !a || !b) return null;
+        const V = r.V || { zA: lvById(a.lv).elev + 0.3, zB: lvById(b.lv).elev + 0.3, rA: lvById(a.lv).elev + 0.15, rB: lvById(b.lv).elev + 0.15, upA: 0, upB: 0, riser: r.lvh || 0 };
+        return { id: c.id, label: ids[c.id], pts: r.pts, from: a.id, to: b.id, lvA: a.lv, lvB: b.lv, color: typeOf(c.type).color, type: typeOf(c.type).name, radio: !!typeOf(c.type).nocable,
+          ...V, geo: r.geo, vertical: (r.vert || 0) + (r.lvh || 0), total: r.final, pack: r.pack.len, fromName: `${itemName(a)} · ${portOf(a, c.from.port).name}`, toName: `${itemName(b)} · ${portOf(b, c.to.port).name}` };
+      }).filter(Boolean),
+      zones: S.shapes.filter(s => s.kind === 'zone').map(z => ({ lv: z.lv, x: z.x, y: z.y, w: z.w, h: z.h, color: COLORS[z.color] || z.color || COLORS.blue, label: z.label || '', zf: +z.zf || 0, zh: +z.zh || 0 })),
       title: meta.name || 'Plan',
     };
   }
+  let view3d = null;
   async function open3D() {
-    try { const m = await import('./view3d.js'); await m.open3D(scene3D(), { fileBase: fileBase() }); }
-    catch (e) { console.error(e); toast('Die 3D-Ansicht konnte nicht geladen werden: ' + e.message, 6000, 'bad'); }
+    try {
+      const m = await import('./view3d.js');
+      view3d = await m.open3D(scene3D(), {
+        fileBase: fileBase(),
+        fmt: (v) => fmtLen(v, 2),
+        onConnect: (a, b) => openPortPicker(a, b, () => view3d && view3d.refresh(scene3D(), { selectCableOf: [a, b] })),
+        onMount: (id, v) => { const it = itemById(id); if (!it || readonly) return; pushUndo(); it.mz = v; routeCache.clear(); changed(); view3d && view3d.refresh(scene3D()); },
+        onSelect: (id) => { if (itemById(id)) { sel = { ids: new Set([id]), cable: null }; tab = 'sel'; render(); renderPane(); } else if (cableById(id)) { sel = { ids: new Set(), cable: id }; tab = 'sel'; render(); renderPane(); } },
+        onClose: () => { view3d = null; },
+      });
+    } catch (e) { console.error(e); toast('Die 3D-Ansicht konnte nicht geladen werden: ' + e.message, 6000, 'bad'); }
   }
 
   /* ---------- Hilfe ---------- */

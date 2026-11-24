@@ -28,7 +28,9 @@ Läuft ohne Docker und ohne npm-Pakete: nur Node.js 22.13 oder neuer (SQLite ist
 - **Geräte in echter Größe** („Maßstäblich“): Grundfläche aus den Maßen (B × T × H, im Geräte-Bauer und je Gerät einstellbar, sinnvolle Vorgaben nach Gerätename), drehen mit R, Verbinden über den ＋-Griff mit Port-Auswahl; schaltet beim ersten maßstäblichen Grundriss automatisch ein
 - Andere Ebenen blass einblenden zum Ausrichten; Kabel zwischen Ebenen bekommen den Höhenunterschied automatisch zur Länge dazu (Steigleitung als ↕-Punkt)
 - Packliste nach Ebenen gruppiert, Patchliste mit Spalte „Ort“, PDF-Export mit einer Planseite je Ebene
-- 3D-Ansicht: alle Ebenen übereinander mit Grundrissen, Geräten (in echter Größe), Kabeln und Steigleitungen; drehen, zoomen, Ebenen ein-/ausblenden, Abstand regeln, als PNG speichern
+- **Höhen für die 3D-Planung:** Fußbodenhöhe und Raumhöhe je Ebene, Podest und Raumhöhe je Bereich (Zone), Montagehöhe je Gerät (Vorgaben nach Gerätename, z. B. Lautsprecher 2,2 m, Beamer 2,8 m), Kabelweg am Boden, an der Decke oder in fester Höhe (Plan-Standard und je Kabel)
+- Kabellänge mit allen senkrechten Stücken: Gerät ↔ Kabelweg an beiden Enden und Steigleitung zwischen Ebenen, einzeln aufgeschlüsselt
+- **3D-Ansicht:** Ebenen in echter Höhe, Wände aus Vektor-Grundrissen hochgezogen (Fenster als Glas), Podeste, Geräte in Montagehöhe, Kabel mit senkrechten Wegen und hervorgehobenen Steigleitungen. Zwei Geräte nacheinander anklicken verbindet sie – auch über Ebenen hinweg; Montagehöhe direkt in 3D einstellen; Kabel anklicken zeigt die Länge. Ebenen ein-/ausblenden, auseinanderziehen, als PNG speichern
 
 **Grundrisse und Kabellängen**
 - Beliebig viele Grundrisse pro Plan (PNG, JPG, WebP, GIF, SVG oder PDF)
