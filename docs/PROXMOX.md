@@ -40,7 +40,25 @@ Das Skript
 
 Danach `http://IP-DES-CONTAINERS:8080` öffnen und das erste Konto anlegen – es wird Admin.
 
-### Aktualisieren
+### Aktualisieren per Git (empfohlen)
+
+Im Container (Konsole in Proxmox oder `pct enter 120`):
+
+```bash
+bash /opt/patchplaner/deploy/update.sh
+```
+
+Das Skript holt den aktuellen Stand von GitHub, setzt die Rechte und startet den Dienst neu. Daten (`data/`) und `.env` bleiben erhalten. Beim ersten Aufruf installiert es `git` und macht `/opt/patchplaner` zu einem Git-Checkout; danach geht auch einfach `cd /opt/patchplaner && git pull && systemctl restart patchplaner`.
+
+Ist `deploy/update.sh` auf dem Server noch nicht vorhanden (Installation vor dem Update-Skript), einmalig:
+
+```bash
+apt-get install -y curl && curl -fsSL https://raw.githubusercontent.com/Heimwaerts-Filderstadt-Technikteam/PatchPlaner/main/deploy/update.sh | bash
+```
+
+Direkt vom Proxmox-Host aus geht es ohne Konsole im Container: `pct exec 120 -- bash /opt/patchplaner/deploy/update.sh`
+
+### Aktualisieren per ZIP
 
 ```bash
 bash /root/proxmox-lxc.sh update 120 /root/PatchPlaner-neu.zip

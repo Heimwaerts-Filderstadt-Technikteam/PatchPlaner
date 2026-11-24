@@ -65,7 +65,7 @@ sudo nano /opt/patchplaner/.env      # BASE_URL, ggf. SMTP
 sudo systemctl restart patchplaner
 ```
 
-Das Skript installiert bei Bedarf Node.js 22 und poppler-utils (für PDF-Grundrisse), legt den Benutzer `patchplaner` an, kopiert alles nach `/opt/patchplaner` und richtet den systemd-Dienst ein. Updates: neue Version entpacken und das Skript erneut ausführen – Daten und `.env` bleiben erhalten.
+Das Skript installiert bei Bedarf Node.js 22 und poppler-utils (für PDF-Grundrisse), legt den Benutzer `patchplaner` an, kopiert alles nach `/opt/patchplaner` und richtet den systemd-Dienst ein. Updates: `sudo bash /opt/patchplaner/deploy/update.sh` (holt den neuen Stand per Git und startet neu) – oder neue Version entpacken und das Skript erneut ausführen. Daten und `.env` bleiben erhalten.
 
 Danach `http://SERVER:8080` öffnen. Das erste Konto wird Admin.
 
