@@ -71,3 +71,23 @@ export function fmtLen(m, d) {
   if (d == null) return Number(v).toLocaleString('de-DE', { maximumFractionDigits: 1 }) + ' ' + uName();
   return fmtNum(v, d) + ' ' + uName();
 }
+
+/* Abmessungen (cm, Breite × Tiefe × Höhe) für die maßstäbliche Darstellung – Schätzwerte nach Gerätename */
+const DIMS = [
+  [/sub/i, [60, 65, 60]], [/line.?array/i, [70, 50, 30]], [/monitor.?box|wedge|bühnenmonitor/i, [55, 40, 30]],
+  [/lautsprecher|speaker|\bbox\b|topteil/i, [35, 35, 60]],
+  [/digitalmischpult|mischpult|mixer|konsole/i, [90, 60, 20]], [/kleinmischer/i, [35, 45, 12]],
+  [/ptz/i, [18, 20, 20]], [/studiokamera|kamera|camera/i, [40, 60, 50]], [/camcorder/i, [20, 35, 20]],
+  [/fernseher|display|\btv\b/i, [125, 30, 75]], [/beamer|projektor/i, [45, 40, 15]], [/led-?wand/i, [48, 40, 9]], [/monitor/i, [60, 20, 40]],
+  [/stagebox|multicore/i, [50, 45, 20]], [/rack/i, [60, 80, 100]],
+  [/handheld|funksender|mikrofon|\bmic\b/i, [8, 8, 25]], [/beltpack|taschensender|in-?ear/i, [8, 4, 12]],
+  [/di-?box/i, [12, 18, 6]], [/wandler|konverter|hdbaset|verteiler 1/i, [12, 16, 4]],
+  [/moving/i, [45, 35, 60]], [/par|spot|scheinwerfer|fluter|led-?bar/i, [30, 30, 40]], [/dimmer|lichtpult/i, [70, 45, 15]],
+  [/wandsteckdose/i, [8, 8, 8]], [/mehrfach|steckdosen/i, [45, 8, 6]], [/usv/i, [48, 50, 9]], [/stromverteiler/i, [40, 30, 30]],
+  [/laptop|notebook/i, [35, 25, 3]], [/tablet|ipad/i, [25, 18, 2]], [/computer|\bpc\b|mac/i, [20, 20, 35]],
+  [/kreuzschiene|router|switch|bildmischer|recorder|encoder|endstufe|empfänger|receiver|interface|intercom|sender/i, [48, 35, 9]],
+];
+export function dimDefault(name) {
+  for (const [re, d] of DIMS) if (re.test(name || '')) return { w: d[0], d: d[1], h: d[2] };
+  return { w: 40, d: 30, h: 15 };
+}

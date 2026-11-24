@@ -1,7 +1,7 @@
 // Meine Geräte, Geräte-Builder, Community-Bibliothek
 import { api } from '../api.js';
 import { $, esc, toast, armButton, shrinkImage } from '../ui.js';
-import { CATS, CATCOL } from '../consts.js';
+import { CATS, CATCOL, dimDefault } from '../consts.js';
 import { itemPreviewSVG } from '../itemsvg.js';
 import { mountPortEditor, portSummary } from '../builder.js';
 import { app, navigate } from '../main.js';
@@ -67,6 +67,7 @@ export async function builder(main, id, query) {
           <label class="fld"><span>Kategorie</span><select class="inp" id="bCat">${CATS.map(c => `<option${c === g.category ? ' selected' : ''}>${c}</option>`).join('')}</select></label>
           <label class="fld"><span>Geräte-ID / Inventar</span><input class="inp" id="bGid" value="${esc(g.gear_id || '')}" placeholder="optional, z. B. CAM-03" maxlength="60"></label>
           <label class="fld"><span>Farbe</span><span class="inline"><input type="color" id="bColor" value="${esc(g.color || '#4a5560')}"><button type="button" class="btn sm" id="bCatColor">Farbe der Kategorie</button></span></label>
+          <div class="fld"><span>Maße B × T × H <em>(cm, für die maßstäbliche Ansicht)</em></span><span class="inline dims"><input class="inp" id="bDw" inputmode="decimal" placeholder="${dimDefault(g.name).w}" value="${g.dim?.w ?? ''}" aria-label="Breite in cm">×<input class="inp" id="bDd" inputmode="decimal" placeholder="${dimDefault(g.name).d}" value="${g.dim?.d ?? ''}" aria-label="Tiefe in cm">×<input class="inp" id="bDh" inputmode="decimal" placeholder="${dimDefault(g.name).h}" value="${g.dim?.h ?? ''}" aria-label="Höhe in cm"></span></div>
         </div>
         ${app.teams.length ? `<label class="fld"><span>Gehört zu</span><select class="inp" id="bTeam"><option value="">Nur mir</option>${app.teams.map(t => `<option value="${t.id}"${t.id === g.team_id ? ' selected' : ''}>Team ${esc(t.name)}</option>`).join('')}</select></label>` : ''}
         <label class="fld"><span>Beschreibungszeilen <em>(erscheinen klein auf dem Gerät, eine pro Zeile)</em></span><textarea class="inp" id="bEls" rows="2" placeholder="z. B. 12G-SDI, Tally">${esc((g.elements || []).join('\n'))}</textarea></label>
@@ -100,6 +101,9 @@ export async function builder(main, id, query) {
   if (sv) sv.onclick = async () => {
     const body = { name: val('#bName').trim(), manufacturer: val('#bMan'), model: val('#bModel'), category: val('#bCat'), color: val('#bColor'), gear_id: val('#bGid'), notes: val('#bNotes'),
       elements: cur().elements, image: g.image, ports: ports.map(p => ({ name: p.name, dir: p.dir, type: p.type })), team_id: $('#bTeam', main)?.value || null };
+    const dn = (s) => { const v = parseFloat(String(val(s) || '').replace(',', '.')); return v > 0 ? v : null; };
+    const dd = dimDefault(body.name);
+    body.dim = { w: dn('#bDw') || dd.w, d: dn('#bDd') || dd.d, h: dn('#bDh') || dd.h };
     if (!body.name) { toast('Gib dem Gerät einen Namen.'); $('#bName', main).focus(); return; }
     sv.disabled = true;
     try {

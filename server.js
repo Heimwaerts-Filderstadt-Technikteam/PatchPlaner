@@ -50,6 +50,8 @@ seed(db, cfg.dataDir);
 const UPLOADS = path.join(cfg.dataDir, 'uploads');
 let hasPdftoppm = false;
 execFile('pdftoppm', ['-v'], (e) => { hasPdftoppm = !e || e.code !== 'ENOENT'; });
+let hasPdftocairo = false;
+execFile('pdftocairo', ['-v'], (e) => { hasPdftocairo = !e || e.code !== 'ENOENT'; });
 
 /* ---------- Kommandozeile ---------- */
 const [, , cmd, a1, a2] = process.argv;
@@ -376,7 +378,7 @@ function gearOut(g, user) {
   const team = g.team_id ? db.prepare('SELECT name FROM teams WHERE id = ?').get(g.team_id) : null;
   return {
     id: g.id, name: g.name, manufacturer: g.manufacturer, model: g.model, category: g.category, color: g.color,
-    ports: J(g.ports, []), elements: J(g.elements, []), image: g.image, gear_id: g.gear_id, notes: g.notes,
+    ports: J(g.ports, []), elements: J(g.elements, []), image: g.image, gear_id: g.gear_id, notes: g.notes, dim: J(g.dim, null),
     is_public: !!g.is_public, builtin: !!g.is_builtin, uses: g.uses, team_id: g.team_id, team_name: team?.name || null,
     author: g.is_builtin ? 'PatchPlaner' : owner?.name || 'Unbekannt', source_id: g.source_id,
     access: user ? gearAccess(user, g) : 'view', created: g.created, updated: g.updated,
@@ -396,7 +398,7 @@ function needAdmin(ctx) { const u = need(ctx); if (!u.is_admin) throw new HttpEr
 /* Öffentliche Konfiguration */
 route('GET', '/api/config', async () => ({
   appName: cfg.appName, version: VERSION, registration: getSetting('registration', true) || userCount() === 0,
-  firstRun: userCount() === 0, smtp: smtpConfigured(cfg.smtp), pdfServer: hasPdftoppm,
+  firstRun: userCount() === 0, smtp: smtpConfigured(cfg.smtp), pdfServer: hasPdftoppm, pdfVector: hasPdftocairo,
 }));
 const userCount = () => db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
 
@@ -681,6 +683,14 @@ route('POST', '/api/plans/:id/assets', async (ctx, { id }) => {
     const pdfPath = path.join(UPLOADS, pid + '.pdf');
     await fsp.writeFile(pdfPath, buf);
     const page = Math.max(1, Math.floor(+um.page || 1));
+    if (um.sourceOnly) {
+      // Nur als Quelle speichern – die Seiten holt der Browser als Vektor (SVG) und filtert sie
+      let pages = 1;
+      try { pages = (await pdfInfo(pdfPath)).pages; } catch (e) { fs.rm(pdfPath, { force: true }, () => {}); throw bad('Das PDF konnte nicht gelesen werden.'); }
+      db.prepare('INSERT INTO plan_assets (id, plan_id, kind, mime, filename, file, w, h, meta, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(pid, id, 'pdfsrc', 'application/pdf', filename, pid + '.pdf', null, null, JSON.stringify({ pages }), now());
+      return { id: pid, kind: 'pdfsrc', filename, meta: { pages } };
+    }
     let r;
     try { r = await renderPdfPage(pdfPath, page, um.transparent !== false); }
     catch (e) { fs.rm(pdfPath, { force: true }, () => {}); throw e; }
@@ -688,7 +698,10 @@ route('POST', '/api/plans/:id/assets', async (ctx, { id }) => {
       .run(pid, id, 'pdfsrc', 'application/pdf', filename, pid + '.pdf', null, null, JSON.stringify({ pages: r.pages }), now());
     return storeFloorAsset(id, r.png, 'image/png', filename, { pdf: true, ptPerPx: r.ptPerPx, page, pages: r.pages, src: pid, transparent: um.transparent !== false });
   }
-  const meta = typeof um.ptPerPx === 'number' && um.ptPerPx > 0 ? { pdf: true, ptPerPx: um.ptPerPx, page: um.page || 1, pages: um.pages || 1, transparent: !!um.transparent } : (um.transparent ? { transparent: true } : null);
+  const n = (v) => (typeof v === 'number' && isFinite(v) ? v : 0);
+  const meta = typeof um.ptPerPx === 'number' && um.ptPerPx > 0
+    ? { pdf: true, ptPerPx: um.ptPerPx, page: um.page || 1, pages: um.pages || 1, transparent: !!um.transparent, vector: !!um.vector, ox: n(um.ox), oy: n(um.oy), src: typeof um.src === 'string' && /^[\w-]{4,40}$/.test(um.src) ? um.src : undefined }
+    : (um.transparent ? { transparent: true } : null);
   return storeFloorAsset(id, buf, mime, filename, meta);
 });
 // Weitere Seite aus einem bereits hochgeladenen PDF rendern
@@ -702,6 +715,21 @@ route('POST', '/api/plans/:id/assets/:aid/render', async (ctx, { id, aid }) => {
   const r = await renderPdfPage(path.join(UPLOADS, src.file), page, b.transparent !== false);
   return storeFloorAsset(id, r.png, 'image/png', src.filename, { pdf: true, ptPerPx: r.ptPerPx, page, pages: r.pages, src: aid, transparent: b.transparent !== false });
 });
+// Eine PDF-Seite als Vektor (SVG) – der Browser filtert daraus Wände und Fenster
+route('GET', '/api/plans/:id/assets/:aid/svg', async (ctx, { id, aid }) => {
+  const u = need(ctx); loadPlan(id, u, 'edit');
+  const src = db.prepare("SELECT * FROM plan_assets WHERE id = ? AND plan_id = ? AND kind = 'pdfsrc'").get(aid, id);
+  if (!src) throw new HttpError(404, 'Das PDF ist nicht mehr vorhanden. Lade es neu hoch.');
+  if (!hasPdftocairo) throw new HttpError(415, 'Vektor-Umwandlung ist auf dem Server nicht verfügbar (pdftocairo aus poppler-utils fehlt).');
+  const file = path.join(UPLOADS, src.file);
+  const pages = (await pdfInfo(file)).pages;
+  const page = Math.max(1, Math.floor(+ctx.query.get('page') || 1));
+  if (page > pages) throw bad(`Das PDF hat ${pages} Seite${pages === 1 ? '' : 'n'}. Seite ${page} gibt es nicht.`);
+  const svg = await new Promise((resolve, reject) => execFile('pdftocairo', ['-svg', '-f', String(page), '-l', String(page), file, '-'], { timeout: 120000, maxBuffer: 200 * 1048576 }, (e, out) => (e ? reject(bad('Die PDF-Seite konnte nicht umgewandelt werden.')) : resolve(out))));
+  ctx.res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'no-store', 'X-Pages': String(pages), 'Content-Security-Policy': "default-src 'none'; sandbox" });
+  ctx.res.end(svg);
+  return undefined;
+}, { raw: true });
 route('GET', '/api/assets/:id', async (ctx, { id }) => {
   const a = db.prepare('SELECT a.*, p.owner_id, p.team_id, p.is_template, p.share_token, p.share_enabled FROM plan_assets a JOIN plans p ON p.id = a.plan_id WHERE a.id = ?').get(id);
   if (!a) throw new HttpError(404, 'Datei nicht gefunden.');
@@ -764,21 +792,28 @@ function gearFields(b, u) {
   const team = optStr(b.team_id); if (team && !teamRole(u.id, team)) throw bad('Du bist nicht in diesem Team.');
   const elements = Array.isArray(b.elements) ? b.elements.slice(0, 12).map(e => str(e, 120)).filter(Boolean) : [];
   return { name, manufacturer: optStr(b.manufacturer, 80), model: optStr(b.model, 80), category: str(b.category, 40) || 'Eigene', color: optStr(b.color, 20) || '#4a5560',
-    ports: JSON.stringify(cleanPorts(b.ports || [])), elements: JSON.stringify(elements), image: cleanImage(b.image), gear_id: optStr(b.gear_id, 60), notes: optStr(b.notes, 2000), team_id: team };
+    ports: JSON.stringify(cleanPorts(b.ports || [])), elements: JSON.stringify(elements), image: cleanImage(b.image), gear_id: optStr(b.gear_id, 60), notes: optStr(b.notes, 2000), team_id: team, dim: cleanDim(b.dim) };
+}
+// Abmessungen in cm (Breite, Tiefe, Höhe) – alles andere wird verworfen
+function cleanDim(d) {
+  if (!d || typeof d !== 'object') return null;
+  const n = (v) => { const x = Math.round(+v * 10) / 10; return x > 0 && x <= 5000 ? x : null; };
+  const o = { w: n(d.w), d: n(d.d), h: n(d.h) };
+  return o.w && o.d ? JSON.stringify(o) : null;
 }
 route('POST', '/api/gear', async (ctx) => {
   const u = need(ctx); const f = gearFields(await jsonBody(ctx.req), u); const id = uid();
-  db.prepare(`INSERT INTO gear (id, owner_id, team_id, name, manufacturer, model, category, color, ports, elements, image, gear_id, notes, created, updated)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, u.id, f.team_id, f.name, f.manufacturer, f.model, f.category, f.color, f.ports, f.elements, f.image, f.gear_id, f.notes, now(), now());
+  db.prepare(`INSERT INTO gear (id, owner_id, team_id, name, manufacturer, model, category, color, ports, elements, image, gear_id, notes, dim, created, updated)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, u.id, f.team_id, f.name, f.manufacturer, f.model, f.category, f.color, f.ports, f.elements, f.image, f.gear_id, f.notes, f.dim, now(), now());
   return gearOut(db.prepare('SELECT * FROM gear WHERE id = ?').get(id), u);
 });
 route('PUT', '/api/gear/:id', async (ctx, { id }) => {
   const u = need(ctx); const g = db.prepare('SELECT * FROM gear WHERE id = ?').get(id);
   const acc = gearAccess(u, g); if (!acc || acc === 'view') throw new HttpError(404, 'Gerät nicht gefunden.');
   const f = gearFields(await jsonBody(ctx.req), u);
-  db.prepare(`UPDATE gear SET team_id = ?, name = ?, manufacturer = ?, model = ?, category = ?, color = ?, ports = ?, elements = ?, image = ?, gear_id = ?, notes = ?, updated = ? WHERE id = ?`)
-    .run(f.team_id, f.name, f.manufacturer, f.model, f.category, f.color, f.ports, f.elements, f.image, f.gear_id, f.notes, now(), id);
+  db.prepare(`UPDATE gear SET team_id = ?, name = ?, manufacturer = ?, model = ?, category = ?, color = ?, ports = ?, elements = ?, image = ?, gear_id = ?, notes = ?, dim = ?, updated = ? WHERE id = ?`)
+    .run(f.team_id, f.name, f.manufacturer, f.model, f.category, f.color, f.ports, f.elements, f.image, f.gear_id, f.notes, f.dim, now(), id);
   return gearOut(db.prepare('SELECT * FROM gear WHERE id = ?').get(id), u);
 });
 route('DELETE', '/api/gear/:id', async (ctx, { id }) => {
@@ -815,9 +850,9 @@ route('POST', '/api/community/:id/copy', async (ctx, { id }) => {
   const u = need(ctx); const g = db.prepare('SELECT * FROM gear WHERE id = ? AND is_public = 1').get(id);
   if (!g) throw new HttpError(404, 'Gerät nicht gefunden.');
   const nid = uid();
-  db.prepare(`INSERT INTO gear (id, owner_id, name, manufacturer, model, category, color, ports, elements, image, notes, source_id, created, updated)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(nid, u.id, g.name, g.manufacturer, g.model, g.category, g.color, g.ports, g.elements, g.image, g.notes, g.id, now(), now());
+  db.prepare(`INSERT INTO gear (id, owner_id, name, manufacturer, model, category, color, ports, elements, image, notes, dim, source_id, created, updated)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(nid, u.id, g.name, g.manufacturer, g.model, g.category, g.color, g.ports, g.elements, g.image, g.notes, g.dim ?? null, g.id, now(), now());
   db.prepare('UPDATE gear SET uses = uses + 1 WHERE id = ?').run(id);
   return gearOut(db.prepare('SELECT * FROM gear WHERE id = ?').get(nid), u);
 });
@@ -953,7 +988,7 @@ route('DELETE', '/api/admin/users/:id', async (ctx, { id }) => {
 route('GET', '/api/admin/settings', async (ctx) => {
   needAdmin(ctx);
   const c = (t) => db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
-  return { registration: getSetting('registration', true), smtp: smtpConfigured(cfg.smtp), smtpFrom: cfg.smtp.from || null, pdfServer: hasPdftoppm,
+  return { registration: getSetting('registration', true), smtp: smtpConfigured(cfg.smtp), smtpFrom: cfg.smtp.from || null, pdfServer: hasPdftoppm, pdfVector: hasPdftocairo,
     stats: { users: c('users'), plans: c('plans'), gear: c('gear'), teams: c('teams') }, version: VERSION, node: process.version, dataDir: cfg.dataDir };
 });
 route('PUT', '/api/admin/settings', async (ctx) => {

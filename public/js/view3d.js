@@ -74,7 +74,7 @@ export async function open3D(scene, { fileBase = 'plan' } = {}) {
   const LS = Math.max(0.42, span / 55); // Schriftgröße passend zur Gebäudegröße
   // Geräte als kompakte Blöcke: das Schaltplan-Symbol ist oft viel breiter als das echte Gerät
   const box = {};
-  scene.items.forEach(i => { box[i.id] = { x: X(i.x + i.w / 2), z: Z(i.y + i.h / 2), w: Math.min(1.2, Math.max(0.35, i.w / U)), d: Math.min(0.8, Math.max(0.3, i.h / U)) }; });
+  scene.items.forEach(i => { box[i.id] = i.real ? { x: X(i.x + i.w / 2), z: Z(i.y + i.h / 2), w: Math.max(0.05, i.real.w), d: Math.max(0.05, i.real.d), h: Math.max(0.05, i.real.h) } : { x: X(i.x + i.w / 2), z: Z(i.y + i.h / 2), w: Math.min(1.2, Math.max(0.35, i.w / U)), d: Math.min(0.8, Math.max(0.3, i.h / U)), h: 0.45 }; });
 
   function label(text, { size = 0.42, color = fg, bgc = null } = {}) {
     const fs = 64, pad = 18;
@@ -143,11 +143,11 @@ export async function open3D(scene, { fileBase = 'plan' } = {}) {
     // Geräte: flache Kacheln in Gerätefarbe, Name darüber
     for (const i of it) {
       const bb = box[i.id];
-      const g = keep(new T.BoxGeometry(bb.w, 0.45, bb.d));
+      const g = keep(new T.BoxGeometry(bb.w, bb.h, bb.d));
       const mesh = new T.Mesh(g, keep(new T.MeshLambertMaterial({ color: new T.Color(i.color) })));
-      mesh.position.set(bb.x, 0.225, bb.z); root.add(mesh);
+      mesh.position.set(bb.x, bb.h / 2, bb.z); root.add(mesh);
       const e = new T.LineSegments(keep(new T.EdgesGeometry(g)), keep(new T.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.35 }))); e.position.copy(mesh.position); root.add(e);
-      const lb = label(i.name, { size: LS, color: fg, bgc: scene.dark ? 'rgba(20,24,28,.85)' : 'rgba(255,255,255,.9)' }); lb.position.set(mesh.position.x, 0.45 + LS * 0.9, mesh.position.z); root.add(lb); groups[l.id].labels.push(lb);
+      const lb = label(i.name, { size: LS, color: fg, bgc: scene.dark ? 'rgba(20,24,28,.85)' : 'rgba(255,255,255,.9)' }); lb.position.set(mesh.position.x, bb.h + LS * 0.9, mesh.position.z); root.add(lb); groups[l.id].labels.push(lb);
     }
   }
   // Kabel (eigene Gruppe, weil sie Ebenen verbinden)
@@ -185,7 +185,7 @@ export async function open3D(scene, { fileBase = 'plan' } = {}) {
   const ymid = () => { const v = levels.filter(l => visible.has(l.id)); return v.length ? (Math.min(...v.map(l => baseY[l.id])) + Math.max(...v.map(l => baseY[l.id]))) / 2 * gap : 0; };
   function viewOblique() {
     const yr = levels.length ? (Math.max(...levels.map(l => baseY[l.id])) - Math.min(...levels.map(l => baseY[l.id]))) * gap : 0;
-    const d = Math.max(10, span * 0.95 + yr * 0.6);
+    const d = Math.max(10, span * 1.25 + yr * 0.6);
     controls.target.set(0, ymid(), 0);
     camera.position.set(-d * 0.62, ymid() + d * 0.72, d * 0.78);
     controls.update(); draw();

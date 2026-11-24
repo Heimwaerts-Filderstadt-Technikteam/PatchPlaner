@@ -1,8 +1,8 @@
 // PatchPlaner Plan-Editor
 import { api, clientId, ApiError } from './api.js';
-import { U, TYPES, FT_LENS, typeOf, DIRS, COLORS, COLNAMES, SYMS, SHAPES, CATCOL, units, toUser, fromUser, uName, fmtLen, fmtNum, M_PER_FT } from './consts.js';
+import { U, TYPES, FT_LENS, typeOf, DIRS, COLORS, COLNAMES, SYMS, SHAPES, CATCOL, units, toUser, fromUser, uName, fmtLen, fmtNum, M_PER_FT, dimDefault } from './consts.js';
 import { $, $$, esc, trunc, uid, clamp, toast, modal, armButton, copyText, download, relTime, fmtDate, initials, avatarColor, debounce } from './ui.js';
-import { layout, anchorOf, itemInner, clearLayoutCache, itemPreviewSVG } from './itemsvg.js';
+import { layout, anchorOf, itemInner, clearLayoutCache, itemPreviewSVG, textOn } from './itemsvg.js';
 import { routeOrtho, simplify, pathWithHops, segmentsOf } from './routing.js';
 import { mountPortEditor, portSummary, typeOptions } from './builder.js';
 import { renderPlanCanvas, canvasBlob, buildPdf, toCSV, pdfToPngBrowser, whiteToAlphaBlob } from './export.js';
@@ -52,10 +52,13 @@ export async function openEditor(root, opts) {
     s.cables.forEach(c => { c.wps = c.wps || []; c.extra = c.extra || 0; });
     // Ebenen (UG, EG, Empore …): jedes Gerät, jede Form und jeder Grundriss gehört zu genau einer Ebene
     const lv = Array.isArray(d.levels) && d.levels.length ? d.levels : [{ id: uid(), name: 'EG', elev: 0 }];
-    s.levels = lv.map(l => ({ id: l.id || uid(), name: String(l.name || 'Ebene'), elev: Number.isFinite(+l.elev) ? +l.elev : 0 }));
+    s.levels = lv.map(l => ({ id: l.id || uid(), name: String(l.name || 'Ebene'), elev: Number.isFinite(+l.elev) ? +l.elev : 0, scale: +l.scale > 0 ? +l.scale : null }));
     const lvIds = new Set(s.levels.map(l => l.id));
     for (const o of [...s.items, ...s.shapes, ...s.floors]) if (!lvIds.has(o.lv)) o.lv = s.levels[0].id;
     s.packLevels = d.packLevels ?? true;
+    // Maßstäbliche Geräte: Grundfläche in echter Größe statt Schaltplan-Symbol
+    s.real = !!d.real; s.realSet = !!d.realSet || !!d.real;
+    s.items.forEach(it => { it.rot = [0, 90, 180, 270].includes(+it.rot) ? +it.rot : 0; });
     return s;
   }
 
@@ -85,6 +88,7 @@ export async function openEditor(root, opts) {
         <div class="grp">
           ${readonly ? '<button data-mode="measure" title="Strecke messen (M)">Messen</button>' : '<button data-act="grid" id="bGrid" title="Am Raster ausrichten (G)">Raster</button>'}
           ${readonly ? '' : '<button data-act="orient" id="bOrient" title="Ausrichtung umschalten (L)">LTR</button>'}
+          <button data-act="real" id="bReal" title="Geräte in echter Größe zeigen (Maßstab des Grundrisses)">Maßstäblich</button>
           <button data-act="fit" title="Alles einpassen (F)">Einpassen</button>
           <button data-act="zoomout" title="Verkleinern (−)" aria-label="Verkleinern">−</button>
           <button data-act="zoomin" title="Vergrößern (+)" aria-label="Vergrößern">+</button>
@@ -256,10 +260,21 @@ export async function openEditor(root, opts) {
 
   /* ---------- Geometrie ---------- */
   const lay = (it) => layout(it, S.orient);
-  function itemBox(it) { const g = lay(it); return { x: it.x, y: it.y, w: g.w * S.ds, h: g.h * S.ds }; }
+  const dimOf = (it) => (it.dim && it.dim.w > 0 && it.dim.d > 0 ? it.dim : dimDefault(it.name));
+  function realSize(it) { const d = dimOf(it), w = d.w / 100 * U, h = d.d / 100 * U; return it.rot === 90 || it.rot === 270 ? { w: h, h: w } : { w, h }; }
+  function itemBox(it) { if (S.real) { const r = realSize(it); return { x: it.x, y: it.y, w: r.w, h: r.h }; } const g = lay(it); return { x: it.x, y: it.y, w: g.w * S.ds, h: g.h * S.ds }; }
   function center(it) { const b = itemBox(it); return { x: b.x + b.w / 2, y: b.y + b.h / 2 }; }
-  const anchor = (it, pid, toward, side) => anchorOf(it, pid, S.orient, S.ds, toward, side);
-  const stubOf = (A) => { const v = SIDE_V[A.side]; return { x: A.x + v[0] * STUB, y: A.y + v[1] * STUB, side: A.side }; };
+  const anchor = (it, pid, toward, side) => (S.real ? realAnchor(it, pid, toward) : anchorOf(it, pid, S.orient, S.ds, toward, side));
+  // Maßstäblich: Kabel setzen an der Gerätekante an, die zum Ziel zeigt; mehrere Ports verteilen sich entlang der Kante
+  function realAnchor(it, pid, toward) {
+    const idx = it.ports.findIndex(p => p.id === pid); if (idx < 0) return null;
+    const b = itemBox(it), cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    const t = toward || { x: cx + 1, y: cy }, dx = t.x - cx, dy = t.y - cy;
+    const f = 0.25 + 0.5 * ((idx + 0.5) / it.ports.length);
+    if (Math.abs(dx) / b.w >= Math.abs(dy) / b.h) return dx >= 0 ? { x: b.x + b.w, y: b.y + b.h * f, side: 'R' } : { x: b.x, y: b.y + b.h * f, side: 'L' };
+    return dy >= 0 ? { x: b.x + b.w * f, y: b.y + b.h, side: 'B' } : { x: b.x + b.w * f, y: b.y, side: 'T' };
+  }
+  const stubOf = (A) => { const v = SIDE_V[A.side], st = S.real ? 6 : STUB; return { x: A.x + v[0] * st, y: A.y + v[1] * st, side: A.side }; };
   function simpleOrtho(A2, B2) {
     const hA = A2.side === 'L' || A2.side === 'R', hB = B2.side === 'L' || B2.side === 'R';
     if (hA && hB) { const mx = (A2.x + B2.x) / 2; return [A2, { x: mx, y: A2.y }, { x: mx, y: B2.y }, B2]; }
@@ -375,6 +390,7 @@ export async function openEditor(root, opts) {
     if (ghosts) S.items.forEach(it => { if (!onLv(it)) shownGhosts.add(it.id); });
     visCables.forEach(c => { [c.from.item, c.to.item].forEach(id => { const it = itemById(id); if (it && !onLv(it)) shownGhosts.add(id); }); });
     const itemG = (it, ghost) => {
+      if (S.real) return realItemG(it, ghost, cm);
       const inner = itemInner(it, S.orient, (p) => cm.has(it.id + '/' + p.id));
       const tag = ghost ? `<text class="t-ghost" x="0" y="${-20}">↕ ${esc(lvById(it.lv).name)}</text>` : '';
       return `<g class="item${ghost ? ' ghost' : ''}${sel.ids.has(it.id) ? ' sel' : ''}" data-item="${it.id}"${ghost ? ' data-ghost="1"' : ''} transform="translate(${it.x} ${it.y}) scale(${S.ds})">${tag}${inner.svg}</g>`;
@@ -387,6 +403,24 @@ export async function openEditor(root, opts) {
     $('#scalebar', E).innerHTML = `${m.toLocaleString('de-DE')} ${uName()}<div style="width:${m * unitM * U * z}px"></div>`;
     $('#zoomlbl', E).textContent = Math.round(z * 100) + ' %';
     renderLegend(); renderHud(); renderLvBar();
+  }
+  // Gerät in echter Größe: Grundfläche in Gerätefarbe, Vorderkante markiert, Name darunter
+  function realItemG(it, ghost, cm) {
+    const b = itemBox(it), w = b.w, h = b.h, z = view.z, isSel = sel.ids.has(it.id);
+    const fs = clamp(11 / z, 0.18 * U, 0.7 * U), used = it.ports.filter(p => cm.has(it.id + '/' + p.id)).length;
+    const fg = textOn(it.color);
+    // Vorderseite (bei 0° unten)
+    const fr = { 0: [0, h, w, h], 90: [0, 0, 0, h], 180: [0, 0, w, 0], 270: [w, 0, w, h] }[it.rot || 0];
+    const inside = Math.min(w, h) > fs * 1.6 && w > fs * 0.6 * Math.min(itemName(it).length, 14);
+    let o = `<title>${esc(itemName(it))}${it.label ? ' · ' + esc(it.name) : ''}
+${fmtNum(dimOf(it).w, 0)} × ${fmtNum(dimOf(it).d, 0)} cm · ${used}/${it.ports.length} Ports belegt</title>`;
+    o += `<rect class="body real" width="${w}" height="${h}" rx="${Math.min(w, h) * 0.08}" style="fill:${esc(it.color)}"/>`;
+    o += `<line class="front" x1="${fr[0]}" y1="${fr[1]}" x2="${fr[2]}" y2="${fr[3]}"/>`;
+    if (inside) o += `<text class="t-real in" x="${w / 2}" y="${h / 2}" font-size="${fs}" style="fill:${fg}" text-anchor="middle" dominant-baseline="central">${esc(trunc(itemName(it), 14))}</text>`;
+    else o += `<text class="t-real" x="${w / 2}" y="${h + fs * 1.05}" font-size="${fs}" text-anchor="middle">${esc(trunc(itemName(it), 24))}</text>`;
+    if (ghost) o += `<text class="t-ghost" x="0" y="${-fs * 0.5}" font-size="${fs * 0.9}">↕ ${esc(lvById(it.lv).name)}</text>`;
+    if (isSel && !ghost && !readonly) { const r = 10 / z; o += `<g class="linkh" data-linkh="${it.id}" transform="translate(${w + r * 0.6} ${-r * 0.6})"><title>Ziehen zum Verbinden</title><circle r="${r}"/><path d="M${-r * 0.45} 0H${r * 0.45}M0 ${-r * 0.45}V${r * 0.45}"/></g>`; }
+    return `<g class="item realitem${ghost ? ' ghost' : ''}${isSel ? ' sel' : ''}" data-item="${it.id}"${ghost ? ' data-ghost="1"' : ''} transform="translate(${it.x} ${it.y})">${o}</g>`;
   }
   function floorSVG(f, ghost) {
     const a = assets.get(f.asset); if (!a) return '';
@@ -515,6 +549,7 @@ export async function openEditor(root, opts) {
       }
     }
     if (drag && drag.kind === 'link' && drag.cur) o += `<line class="templink" x1="${drag.a.x}" y1="${drag.a.y}" x2="${drag.cur.x}" y2="${drag.cur.y}"/>`;
+    if (drag && drag.kind === 'link2' && drag.cur) { const c0 = center(itemById(drag.from)); o += `<line class="templink" x1="${c0.x}" y1="${c0.y}" x2="${drag.cur.x}" y2="${drag.cur.y}"/>`; }
     if (drag && (drag.kind === 'box' || drag.kind === 'cropbox') && drag.cur) { const b = normBox(drag.p0, drag.cur); o += `<rect class="selbox${drag.kind === 'cropbox' ? ' crop' : ''}" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}"/>`; }
     if (mode === 'crop' && floorById(cropFloor)) { const f = floorById(cropFloor); o += `<rect class="cropframe" x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}"/>`; }
     if (drag && drag.kind === 'draw' && drag.preview) o += shapeSVG(drag.preview);
@@ -611,10 +646,12 @@ export async function openEditor(root, opts) {
     const n = $('#edName', E); if (n && document.activeElement !== n) n.value = meta.name || '';
     $('#bGrid', E)?.classList.toggle('on', S.grid);
     const bo = $('#bOrient', E); if (bo) { bo.textContent = S.orient === 'tb' ? 'Oben → Unten' : 'Links → Rechts'; bo.title = 'Ausrichtung der Geräte umschalten (L)'; }
+    if (bo) bo.hidden = !!S.real;
+    const br = $('#bReal', E); if (br) br.classList.toggle('on', !!S.real);
   }
   function newItemFromGear(g, x, y) {
     return { id: uid(), gear: g.builtin ? null : (g.id || null), src: g.id || null, name: g.name, label: '', inv: g.gear_id || '', notes: '', color: g.color || CATCOL[g.category] || CATCOL.Eigene,
-      elements: [...(g.elements || [])], x: snapV(x), y: snapV(y), ports: (g.ports || []).map(p => ({ id: uid(), name: p.name, dir: p.dir, type: p.type })) };
+      elements: [...(g.elements || [])], dim: g.dim && g.dim.w ? { ...g.dim } : dimDefault(g.name), rot: 0, x: snapV(x), y: snapV(y), ports: (g.ports || []).map(p => ({ id: uid(), name: p.name, dir: p.dir, type: p.type })) };
   }
   function addGear(g, at) {
     pushUndo(); const p = at || viewCenter();
@@ -645,6 +682,44 @@ export async function openEditor(root, opts) {
     S.cables.push(c); sel = { ids: new Set(), cable: c.id }; tab = 'sel';
     if (pf.type !== pt.type && type !== 'wireless') toast(`Adapter nötig: ${typeOf(pf.type).name} ↔ ${typeOf(pt.type).name}. Er steht in der Packliste.`, 3600);
     changed();
+  }
+  // Maßstäblich sind die Ports nicht sichtbar: nach dem Ziehen wählt man sie hier
+  function openPortPicker(aId, bId) {
+    let A = itemById(aId), B = itemById(bId); if (!A || !B) return;
+    const cm = connMap(), free = (it, p) => !cm.has(it.id + '/' + p.id);
+    const outs = (it) => it.ports.filter(p => p.dir !== 'in'), ins = (it) => it.ports.filter(p => p.dir !== 'out');
+    if (!outs(A).some(p => free(A, p)) && outs(B).some(p => free(B, p))) [A, B] = [B, A];
+    const lo = outs(A), li = ins(B);
+    let pa = lo.find(p => free(A, p) && li.some(q => free(B, q) && q.type === p.type)) || lo.find(p => free(A, p));
+    let pb = pa ? (li.find(q => free(B, q) && q.type === pa.type) || li.find(q => free(B, q))) : li.find(q => free(B, q));
+    const row = (it, p, name, chosen) => `<label class="pp-row${free(it, p) ? '' : ' used'}"><input type="radio" name="${name}" value="${p.id}"${chosen && chosen.id === p.id ? ' checked' : ''}${free(it, p) ? '' : ' disabled'}><span class="dot" style="background:${typeOf(p.type).color}"></span><span class="pp-n">${esc(p.name)}</span><span class="small muted">${esc(typeOf(p.type).short || typeOf(p.type).name)}${p.dir === 'io' ? ' · I/O' : ''}${free(it, p) ? '' : ' · belegt'}</span></label>`;
+    const m = modal(`<header><h2>Verbinden</h2><button class="btn sm" data-x>Schließen</button></header>
+      <div class="mb"><div class="pp">
+        <div><h3>${esc(itemName(A))}<span class="small muted"> · Ausgang</span></h3><div class="pp-list">${lo.map(p => row(A, p, 'ppA', pa)).join('') || '<p class="hint">Keine Ausgänge.</p>'}</div></div>
+        <div class="pp-arrow">→</div>
+        <div><h3>${esc(itemName(B))}<span class="small muted"> · Eingang</span></h3><div class="pp-list">${li.map(p => row(B, p, 'ppB', pb)).join('') || '<p class="hint">Keine Eingänge.</p>'}</div></div>
+      </div><button class="btn sm" id="ppSwap">Richtung tauschen</button></div>
+      <footer><button class="btn" data-x>Abbrechen</button><button class="btn pri" id="ppGo">Verbinden</button></footer>`);
+    m.el.querySelector('#ppSwap').onclick = () => { m.close(); openPortPicker(B.id, A.id); };
+    m.el.querySelector('#ppGo').onclick = () => {
+      const a = m.el.querySelector('input[name=ppA]:checked'), b = m.el.querySelector('input[name=ppB]:checked');
+      if (!a || !b) { toast('Wähle auf beiden Seiten einen freien Port.'); return; }
+      m.close(); connect({ item: A.id, port: a.value }, { item: B.id, port: b.value });
+    };
+  }
+  function setReal(on, quiet) {
+    if (!!S.real === !!on) return;
+    if (!quiet) pushUndo();
+    const cs = new Map(S.items.map(it => [it.id, center(it)]));
+    S.real = !!on; S.realSet = true; clearLayoutCache(); routeCache.clear();
+    S.items.forEach(it => { const c = cs.get(it.id), b = itemBox(it); it.x = c.x - b.w / 2; it.y = c.y - b.h / 2; });
+    if (!quiet) { changed(); toast(on ? 'Geräte in echter Größe. Zum Verbinden ein Gerät anklicken und am ＋-Griff auf das Ziel ziehen.' : 'Geräte als Schaltplan-Symbole mit Ports.', 5000); }
+  }
+  // Beim ersten maßstäblichen Grundriss automatisch auf echte Größe umschalten (nur einmal pro Plan)
+  function enableRealOnce() { if (S.realSet) return false; setReal(true, true); return true; }
+  function rotateSel() {
+    const its = [...sel.ids].map(itemById).filter(Boolean); if (!its.length || !S.real) return;
+    pushUndo(); its.forEach(it => { const c = center(it); it.rot = ((it.rot || 0) + 90) % 360; const b = itemBox(it); it.x = c.x - b.w / 2; it.y = c.y - b.h / 2; }); routeCache.clear(); changed();
   }
   function deleteSelection() {
     if (readonly) return;
@@ -701,77 +776,211 @@ export async function openEditor(root, opts) {
   /* Grundriss für eine Ebene laden: Bild oder PDF-Seite, auf Wunsch nur die Zeichnung (transparent) */
   const isPdfFile = (f) => f && (f.type === 'application/pdf' || /\.pdf$/i.test(f.name));
   const pdfSources = () => [...assets.values()].filter(a => a.kind === 'pdfsrc');
+  const isSvgFile = (f) => f && (f.type === 'image/svg+xml' || /\.svg$/i.test(f.name));
+  const lvScale = (lv) => lvById(lv).scale || (S.levels.find(l => l.scale) || {}).scale || 100;
   function openFloorDialog({ file = null, lv = curLv, srcPdf = null, replaceFloor = null } = {}) {
     if (readonly) return;
     let chosen = file;
     const srcs = pdfSources();
+    const vecOk = !!(config && config.pdfVector);
     const m = modal(`<header><h2>Grundriss für eine Ebene</h2><button class="btn sm" data-x>Schließen</button></header>
       <div class="mb">
         <label class="row"><span>Ebene</span><select class="inp" id="fdLv">${lvSorted().map(l => `<option value="${l.id}"${l.id === lv ? ' selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
         <div class="sec"><h3>Quelle</h3>
           <div class="fdsrc">
-            <label class="chk"><input type="radio" name="fdS" value="file"${srcPdf ? '' : ' checked'}> Datei (PDF oder Bild)</label>
-            <div class="inline" id="fdFileRow"><input type="file" id="fdFile" accept="image/*,.pdf,application/pdf"><span class="small muted" id="fdFileName">${chosen ? esc(chosen.name) : ''}</span></div>
+            <label class="chk"><input type="radio" name="fdS" value="file"${srcPdf ? '' : ' checked'}> Datei (PDF, SVG oder Bild)</label>
+            <div class="inline" id="fdFileRow"><input type="file" id="fdFile" accept="image/*,.svg,.pdf,application/pdf"><span class="small muted" id="fdFileName">${chosen ? esc(chosen.name) : ''}</span></div>
             ${srcs.length ? `<label class="chk"><input type="radio" name="fdS" value="pdf"${srcPdf ? ' checked' : ''}> Aus einem schon geladenen PDF</label>
             <select class="inp" id="fdPdf">${srcs.map(a => `<option value="${a.id}"${a.id === srcPdf ? ' selected' : ''}>${esc(a.filename || 'PDF')} – ${a.meta?.pages || 1} Seite${(a.meta?.pages || 1) === 1 ? '' : 'n'}</option>`).join('')}</select>` : ''}
           </div>
         </div>
         <label class="row" id="fdPageRow"><span>PDF-Seite</span><input class="inp" id="fdPage" type="number" min="1" value="1" style="max-width:110px"></label>
-        <label class="chk big"><input type="checkbox" id="fdTr" checked> Nur die Zeichnung übernehmen (weißen Hintergrund entfernen)</label>
-        <p class="hint">Weißes Papier wird durchsichtig, Linien und Beschriftungen bleiben – auch farbige. So liegen die Ebenen sauber übereinander und in der 3D-Ansicht sieht man durch. Plankopf und Legende schneidest du danach mit „Zuschneiden“ weg.</p>
+        <label class="row" id="fdScaleRow"><span>Maßstab der Zeichnung</span><span class="inline">1 : <input class="inp" id="fdScale" type="number" min="1" step="1" value="${lvScale(lv)}" style="max-width:110px"></span></label>
+        <div class="sec" id="fdModeSec"><h3>Was übernehmen?</h3>
+          <div class="fdsrc">
+            <label class="chk" id="fdMVec"><input type="radio" name="fdM" value="vec" checked> <span><b>Nur Wände und Fenster</b> <span class="chip acc">empfohlen</span><br><span class="small muted">Text, Bemaßung, Möbel, Türen, Legende und Plankopf fliegen raus. Du siehst vorher eine Vorschau und kannst korrigieren.</span></span></label>
+            <label class="chk"><input type="radio" name="fdM" value="draw"> <span>Ganze Zeichnung ohne weißen Hintergrund<br><span class="small muted">Alles, was gezeichnet ist, als Bild</span></span></label>
+            <label class="chk"><input type="radio" name="fdM" value="page"> <span>Ganze Seite, wie sie ist</span></label>
+          </div>
+          <p class="hint small" id="fdVecHint" hidden>„Nur Wände und Fenster“ geht mit PDF (braucht pdftocairo auf dem Server) und SVG. Bei PNG/JPG wird die ganze Zeichnung übernommen.</p>
+        </div>
         <label class="chk" id="fdRepRow"><input type="checkbox" id="fdRep" checked> Vorhandenen Grundriss dieser Ebene ersetzen</label>
         <div class="errbox" hidden id="fdErr"></div>
       </div>
-      <footer><button class="btn" data-x>Abbrechen</button><button class="btn pri" id="fdGo">Übernehmen</button></footer>`);
+      <footer><button class="btn" data-x>Abbrechen</button><button class="btn pri" id="fdGo">Weiter</button></footer>`);
     const q = (x) => m.el.querySelector(x);
     const srcMode = () => (m.el.querySelector('input[name=fdS]:checked') || {}).value || 'file';
+    const kind = () => (srcMode() === 'pdf' || isPdfFile(chosen) ? 'pdf' : isSvgFile(chosen) ? 'svg' : chosen ? 'img' : 'pdf');
     const upd = () => {
-      const pdf = srcMode() === 'pdf' || isPdfFile(chosen);
-      q('#fdPageRow').hidden = !pdf;
+      const k = kind();
+      q('#fdPageRow').hidden = k !== 'pdf';
+      q('#fdScaleRow').hidden = k === 'img';
+      const vec = (k === 'pdf' && vecOk) || k === 'svg';
+      q('#fdMVec').hidden = !vec; q('#fdVecHint').hidden = vec;
+      if (!vec && q('input[name=fdM][value=vec]').checked) q('input[name=fdM][value=draw]').checked = true;
       if (srcMode() === 'pdf' && q('#fdPdf')) { const a = assets.get(q('#fdPdf').value); q('#fdPage').max = a?.meta?.pages || 1; }
       const has = S.floors.some(f => f.lv === q('#fdLv').value);
       q('#fdRepRow').hidden = !has;
+      q('#fdGo').textContent = q('input[name=fdM]:checked').value === 'vec' && vec ? 'Weiter zur Vorschau' : 'Übernehmen';
     };
     m.el.addEventListener('change', (e) => {
       if (e.target.id === 'fdFile') { chosen = e.target.files[0] || null; q('#fdFileName').textContent = ''; const r = m.el.querySelector('input[value=file]'); if (r) r.checked = true; }
+      if (e.target.id === 'fdLv') q('#fdScale').value = lvScale(e.target.value);
       upd();
     });
     upd();
     q('#fdGo').onclick = async () => {
       const mode2 = srcMode(); const err = q('#fdErr'); err.hidden = true;
       if (mode2 === 'file' && !chosen) { err.textContent = 'Wähle eine Datei aus.'; err.hidden = false; return; }
+      const lv2 = q('#fdLv').value, page = Math.max(1, Math.floor(+q('#fdPage').value || 1)), scale = Math.max(1, +q('#fdScale').value || 100);
+      const replace = !q('#fdRepRow').hidden && q('#fdRep').checked ? (replaceFloor || S.floors.find(f => f.lv === lv2)?.id) : null;
+      const how = q('input[name=fdM]:checked').value, k = kind();
       const btn = q('#fdGo'); btn.disabled = true; btn.textContent = 'Wird umgewandelt …';
       try {
-        await importFloor({ file: mode2 === 'file' ? chosen : null, srcPdf: mode2 === 'pdf' ? q('#fdPdf').value : null, page: Math.max(1, Math.floor(+q('#fdPage').value || 1)),
-          transparent: q('#fdTr').checked, lv: q('#fdLv').value, replace: !q('#fdRepRow').hidden && q('#fdRep').checked ? (replaceFloor || S.floors.find(f => f.lv === q('#fdLv').value)?.id) : null });
+        if (how === 'vec' && (k === 'svg' || (k === 'pdf' && vecOk))) {
+          let text, src = null, pages = 1, name, unitMm = null;
+          if (k === 'svg') { text = await chosen.text(); name = chosen.name.replace(/\.svg$/i, ''); }
+          else {
+            if (mode2 === 'pdf') src = q('#fdPdf').value;
+            else { const r = await api.upload(`/api/plans/${planId}/assets`, chosen, 'application/pdf', chosen.name, { sourceOnly: true }); assets.set(r.id, { ...r, kind: 'pdfsrc' }); src = r.id; }
+            const a = assets.get(src); pages = a?.meta?.pages || 1;
+            if (page > pages) throw new Error(`Das PDF hat ${pages} Seite${pages === 1 ? '' : 'n'}. Seite ${page} gibt es nicht.`);
+            const r = await fetch(`/api/plans/${planId}/assets/${src}/svg?page=${page}`, { credentials: 'same-origin' });
+            if (!r.ok) { let msg = 'Die PDF-Seite konnte nicht umgewandelt werden.'; try { msg = (await r.json()).error || msg; } catch { /* egal */ } throw new Error(msg); }
+            text = await r.text(); unitMm = 25.4 / 72; name = (a?.filename || 'PDF').replace(/\.pdf$/i, '') + (pages > 1 ? ` S. ${page}` : '');
+          }
+          m.close();
+          await openVecFilter({ text, unitMm, scale, lv: lv2, replace, name, src, page: k === 'pdf' ? page : null, pages });
+          return;
+        }
+        await importFloor({ file: mode2 === 'file' ? chosen : null, srcPdf: mode2 === 'pdf' ? q('#fdPdf').value : null, page, transparent: how !== 'page', lv: lv2, replace, scale: k === 'img' ? null : scale });
         m.close();
-      } catch (e) { err.textContent = e.message || 'Der Grundriss konnte nicht geladen werden.'; err.hidden = false; btn.disabled = false; btn.textContent = 'Übernehmen'; }
+      } catch (e) { err.textContent = e.message || 'Der Grundriss konnte nicht geladen werden.'; err.hidden = false; btn.disabled = false; upd(); }
     };
   }
-  async function importFloor({ file, srcPdf, page = 1, transparent = true, lv = curLv, replace = null }) {
+
+  /* Vorschau und Korrektur: nur Wände und Fenster übernehmen */
+  async function openVecFilter({ text, unitMm, scale, lv, replace, name, src, page, pages }) {
+    const V = await import('./vecfloor.js');
+    let model;
+    try { model = V.parseSVG(text, { unitMm }); } catch (e) { toast(e.message || 'Die Zeichnung konnte nicht gelesen werden.', 5000); return; }
+    if (!model.els.length) { toast('In der Datei sind keine Linien. Ist das PDF ein eingescanntes Bild? Dann „Ganze Zeichnung ohne weißen Hintergrund“ wählen.', 7000); return; }
+    const layerNames = model.layers.map(l => l.name);
+    const useLayers = layerNames.length >= 2;
+    const keepRe = /wand|wände|waende|wall|mauer|fenster|window|glas|stütze|stuetze|column|tragwerk|beton|rohbau|a-wall|a-glaz/i;
+    const st = { cls: {}, windows: true, sheet: true, tolMm: 0.7, showOff: true, mode: useLayers ? 'layers' : 'auto', layers: Object.fromEntries(layerNames.map(n => [n, keepRe.test(n)])) };
+    if (useLayers && !Object.values(st.layers).some(Boolean)) st.mode = 'auto';
+    let cl = null;
+    const m = modal(`<header><h2>Grundriss prüfen – ${esc(name)}</h2><button class="btn sm" data-x>Schließen</button></header>
+      <div class="mb vf">
+        <div class="vf-prev"><canvas id="vfCv"></canvas><div class="vf-leg"><span><i class="k-wall"></i>Wand</span><span><i class="k-win"></i>Fenster</span><span><i class="k-off"></i>wird entfernt</span></div></div>
+        <div class="vf-side">
+          <p class="vf-sum" id="vfSum"></p>
+          ${useLayers ? `<div class="seg" id="vfMode"><button data-vm="layers">Nach Layern</button><button data-vm="auto">Automatisch</button></div>
+          <div id="vfLayers" class="vf-list">${model.layers.map(l => `<label class="chk"><input type="checkbox" data-vl="${esc(l.name)}"> ${esc(l.name)} <span class="small muted">${l.n}</span></label>`).join('')}</div>` : ''}
+          <div id="vfAuto">
+            <h3 class="vf-h">Linienarten</h3>
+            <div id="vfCls" class="vf-list"></div>
+            <label class="chk"><input type="checkbox" id="vfWin" checked> Fenster in Wandöffnungen übernehmen</label>
+            <label class="row"><span>Toleranz</span><input type="range" id="vfTol" min="0.2" max="2" step="0.1" value="0.7"></label>
+          </div>
+          <label class="chk"><input type="checkbox" id="vfSheet" checked> Plankopf, Legende und Blattrahmen entfernen</label>
+          <label class="chk"><input type="checkbox" id="vfOff" checked> Entferntes rot anzeigen</label>
+          <p class="hint small">Text und Bemaßung werden immer entfernt. Was noch fehlt oder zu viel ist, stellst du über die Linienarten ein: <b>Wand</b> wird immer übernommen, <b>Prüfen</b> nur, wenn die Linie zwischen zwei Wandstücken liegt (Fenster), <b>Weg</b> nie.</p>
+        </div>
+      </div>
+      <footer><button class="btn" data-x>Abbrechen</button><button class="btn pri" id="vfGo">Übernehmen</button></footer>`, { wide: true });
+    m.el.classList.add('modal-xl');
+    const q = (x) => m.el.querySelector(x);
+    const cv = q('#vfCv');
+    const run = () => {
+      cl = V.classify(model, { scale, cls: st.cls, windows: st.windows, sheet: st.sheet, tolMm: st.tolMm, layers: st.mode === 'layers' ? Object.fromEntries(Object.entries(st.layers).concat([['(ohne Layer)', false]])) : null });
+      V.drawPreview(cv, model, cl, { showOff: st.showOff });
+      const c = cl.counts;
+      q('#vfSum').innerHTML = `<b>Übernommen:</b> ${c.wall + c.detail} Wandteile${c.window ? `, ${c.window} Fensterlinien` : ''}<br><b>Entfernt:</b> ${c.text} Textzeichen${c.sheet ? `, ${c.sheet === 1 ? 'Plankopf/Legende' : 'Plankopf und Legende'}` : ''}, ${c.off} sonstige Linien`;
+      if (q('#vfMode')) { q('#vfMode').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.vm === st.mode)); q('#vfLayers').hidden = st.mode !== 'layers'; q('#vfAuto').hidden = st.mode === 'layers'; m.el.querySelectorAll('[data-vl]').forEach(i => { i.checked = !!st.layers[i.dataset.vl]; }); }
+      if (st.mode !== 'layers') {
+        q('#vfCls').innerHTML = cl.classes.map(k => `<div class="vf-cls"><span class="vf-sw">${k.kind === 'fill' ? `<i style="background:${k.color}"></i>` : `<b style="height:${Math.max(1, Math.min(6, k.sw * 1.4))}px;background:${k.color}"></b>`}</span>
+          <span class="vf-t">${esc(k.text)}<br><span class="small muted">${k.n}× · ${Math.round(k.share * 100)} %</span></span>
+          <select class="inp sm" data-vc="${esc(k.key)}"><option value="wall"${k.mode === 'wall' ? ' selected' : ''}>Wand</option><option value="auto"${k.mode === 'auto' ? ' selected' : ''}>Prüfen</option><option value="off"${k.mode === 'off' ? ' selected' : ''}>Weg</option></select></div>`).join('');
+      }
+    };
+    m.el.addEventListener('change', (e) => {
+      const t = e.target;
+      if (t.dataset.vc) st.cls[t.dataset.vc] = t.value;
+      if (t.dataset.vl) st.layers[t.dataset.vl] = t.checked;
+      if (t.id === 'vfWin') st.windows = t.checked;
+      if (t.id === 'vfSheet') st.sheet = t.checked;
+      if (t.id === 'vfOff') st.showOff = t.checked;
+      run();
+    });
+    m.el.addEventListener('input', (e) => { if (e.target.id === 'vfTol') { st.tolMm = +e.target.value; run(); } });
+    m.el.addEventListener('click', (e) => { const b = e.target.closest('[data-vm]'); if (b) { st.mode = b.dataset.vm; run(); } });
+    const ro = new ResizeObserver(() => cl && V.drawPreview(cv, model, cl, { showOff: st.showOff })); ro.observe(cv);
+    requestAnimationFrame(run);
+    q('#vfGo').onclick = async () => {
+      const btn = q('#vfGo'); btn.disabled = true; btn.textContent = 'Wird gespeichert …';
+      try {
+        const out = V.buildSVG(model, cl);
+        const blob = new Blob([out.svg], { type: 'image/svg+xml' });
+        const ptPerPx = model.unitMm / (25.4 / 72);
+        const res = await api.upload(`/api/plans/${planId}/assets`, blob, 'image/svg+xml', name + '.svg', { ptPerPx, page: page || 1, pages, vector: true, ox: out.ox, oy: out.oy, src: src || undefined });
+        assets.set(res.id, { ...res, kind: 'floor' });
+        ro.disconnect(); m.close();
+        placeFloor(res, { lv, replace, name, scale, vector: true });
+      } catch (e) { toast(e.message || 'Speichern fehlgeschlagen.', 5000); btn.disabled = false; btn.textContent = 'Übernehmen'; }
+    };
+  }
+  async function importFloor({ file, srcPdf, page = 1, transparent = true, lv = curLv, replace = null, scale = null }) {
     let res, name;
     if (srcPdf) { res = await api.post(`/api/plans/${planId}/assets/${srcPdf}/render`, { page, transparent }); name = (assets.get(srcPdf)?.filename || 'PDF').replace(/\.pdf$/i, ''); }
     else if (isPdfFile(file)) {
       if (config && config.pdfServer) res = await api.upload(`/api/plans/${planId}/assets`, file, 'application/pdf', file.name, { page, transparent });
       else { const r = await pdfToPngBrowser(file, page, transparent); res = await api.upload(`/api/plans/${planId}/assets`, r.blob, 'image/png', file.name.replace(/\.pdf$/i, '.png'), { ptPerPx: r.ptPerPx, page, pages: r.pages, transparent }); }
       name = file.name.replace(/\.pdf$/i, '');
+    } else if (isSvgFile(file)) {
+      // SVG ganz übernehmen: Maßstab aus den Einheiten der Datei
+      const text = await file.text(); const V = await import('./vecfloor.js'); const md = V.parseSVG(text);
+      res = await api.upload(`/api/plans/${planId}/assets`, file, 'image/svg+xml', file.name, { ptPerPx: md.unitMm / (25.4 / 72), page: 1, pages: 1, transparent: true });
+      name = file.name.replace(/\.svg$/i, '');
     } else {
-      const blob = transparent && !/svg/.test(file.type) ? await whiteToAlphaBlob(file) : file;
-      res = await api.upload(`/api/plans/${planId}/assets`, blob, transparent && !/svg/.test(file.type) ? 'image/png' : (file.type || 'image/png'), file.name, { transparent });
+      const blob = transparent ? await whiteToAlphaBlob(file) : file;
+      res = await api.upload(`/api/plans/${planId}/assets`, blob, transparent ? 'image/png' : (file.type || 'image/png'), file.name, { transparent });
       name = file.name.replace(/\.[^.]+$/, '');
     }
     assets.set(res.id, { ...res, kind: 'floor' });
     if (res.meta && res.meta.src && !assets.has(res.meta.src)) assets.set(res.meta.src, { id: res.meta.src, kind: 'pdfsrc', filename: file ? file.name : name + '.pdf', meta: { pages: res.meta.pages } });
     if (res.meta && res.meta.pages > 1 && !srcPdf && page === 1) setTimeout(() => toast(`Das PDF hat ${res.meta.pages} Seiten. Weitere Seiten weist du anderen Ebenen über „Grundriss zuweisen → aus einem schon geladenen PDF“ zu.`, 7000), 800);
-    placeFloor(res, { lv, replace, name: name + (res.meta && res.meta.pages > 1 ? ` S. ${res.meta.page}` : '') });
+    placeFloor(res, { lv, replace, name: name + (res.meta && res.meta.pages > 1 ? ` S. ${res.meta.page}` : ''), scale });
   }
   // Maßstab (Welt-Einheiten pro PDF-Punkt) eines kalibrierten PDF-Grundrisses
   function worldPerPt(f) { const a = assets.get(f.asset); if (!f.pdf || !f.pdf.ptPerPx || !a || !f.calibrated) return null; return (f.w / cropOf(f).w) / f.pdf.ptPerPx; }
-  function placeFloor(res, { lv, replace, name }) {
+  // Ursprung der Original-Blattkoordinaten in Weltkoordinaten (für das Ausrichten von Ebenen aus demselben Plansatz)
+  function pageOrigin(f) { const c = cropOf(f), k = f.w / c.w; return { x: f.x - (c.x + (f.pdf?.ox || 0)) * k, y: f.y - (c.y + (f.pdf?.oy || 0)) * k }; }
+  const worldPerPx = (f, N) => f.pdf.ptPerPx * 0.000352778 * N * U;
+  function placeFloor(res, { lv, replace, name, scale = null, vector = false }) {
     pushUndo();
     const old = replace ? floorById(replace) : null;
-    const f = { id: uid(), lv, asset: res.id, src: res.meta?.src || null, page: res.meta?.page || null, name, x: 0, y: 0, w: 0, h: 0, w0: res.w, opacity: 0.9, visible: true, invert: true,
-      calibrated: false, locked: true, transparent: !!res.meta?.transparent, pdf: res.meta && res.meta.ptPerPx ? { ptPerPx: res.meta.ptPerPx } : null };
+    const f = { id: uid(), lv, asset: res.id, src: res.meta?.src || null, page: res.meta?.page || null, name, x: 0, y: 0, w: 0, h: 0, w0: res.w, opacity: vector ? 1 : 0.9, visible: true, invert: true,
+      calibrated: false, locked: true, transparent: !!res.meta?.transparent || vector, vector, pdf: res.meta && res.meta.ptPerPx ? { ptPerPx: res.meta.ptPerPx, ox: res.meta.ox || 0, oy: res.meta.oy || 0 } : null };
+    if (f.pdf && scale > 0) {
+      // Maßstab bekannt: Größe direkt aus dem Zeichnungsmaßstab, Lage nach Blattkoordinaten wie die anderen Ebenen
+      const k = worldPerPx(f, scale); f.w = res.w * k; f.h = res.h * k;
+      const pdfs = S.floors.filter(o => o !== old && o.pdf && o.calibrated);
+      const ref = (old && old.pdf && old.calibrated ? old : null) || pdfs.find(o => o.src && o.src === f.src) || pdfs.sort((a, b) => (a.lv === lv) - (b.lv === lv))[0] || null;
+      let o0 = ref ? pageOrigin(ref) : null;
+      if (!o0 && old) o0 = { x: old.x - f.pdf.ox * k, y: old.y - f.pdf.oy * k };
+      if (!o0) { const b = S.items.some(i => i.lv === lv) ? contentBounds(false, lv) : null; o0 = b ? { x: b.x - f.pdf.ox * k, y: b.y - f.pdf.oy * k } : { x: -f.pdf.ox * k, y: -f.pdf.oy * k }; }
+      f.x = o0.x + f.pdf.ox * k; f.y = o0.y + f.pdf.oy * k; f.calibrated = true; f.pdfScale = scale;
+      lvById(lv).scale = scale;
+      if (old) S.floors = S.floors.filter(o => o !== old);
+      S.floors.push(f);
+      if (lv !== curLv) switchLevel(lv, true);
+      const auto = enableRealOnce();
+      changed(); fit(f); tab = 'plan'; renderPane();
+      toast(`Maßstab 1:${scale} – die Kabellängen stimmen damit.` + (ref ? ` Lage wie „${lvById(ref.lv).name}“ (gleiche Blattkoordinaten); sonst mit „Verschieben“ anpassen.` : '') + (auto ? ' Geräte werden jetzt maßstäblich gezeigt.' : ''), 6500);
+      return;
+    }
     // Lage und Maßstab: vom ersetzten Grundriss oder von einem kalibrierten PDF einer anderen Ebene übernehmen
     const ref = (old && worldPerPt(old) ? old : null) || S.floors.filter(o => o !== old && worldPerPt(o)).sort((a, b) => (a.lv === lv) - (b.lv === lv))[0] || null;
     let how = '';
@@ -843,7 +1052,7 @@ export async function openEditor(root, opts) {
     const sug = ['UG', 'EG', 'OG', 'Empore', '1. OG', '2. OG', 'Dach'].find(n => !names.includes(n)) || `Ebene ${S.levels.length + 1}`;
     const elev = sug === 'UG' ? Math.min(...S.levels.map(l => l.elev)) - 3 : Math.max(...S.levels.map(l => l.elev)) + 3.5;
     pushUndo();
-    const l = { id: uid(), name: sug, elev: Math.round(elev * 10) / 10 };
+    const l = { id: uid(), name: sug, elev: Math.round(elev * 10) / 10, scale: (S.levels.find(x => x.scale) || {}).scale || null };
     S.levels.push(l); markDirty(); renamingLv = l.id; freshLv = l.id; switchLevel(l.id, true); changed();
   }
   // Höhe einer frisch angelegten Ebene aus ihrem Namen ableiten (Keller/UG nach unten, alles andere nach oben)
@@ -927,6 +1136,8 @@ export async function openEditor(root, opts) {
     }
     const h = e.target.closest('[data-h]');
     if (h) { const s = shapeById([...sel.ids][0]); pushUndo(); drag = { kind: 'handle', h: h.dataset.h, id: s.id }; return; }
+    const lh = e.target.closest('[data-linkh]');
+    if (lh) { drag = { kind: 'link2', from: lh.dataset.linkh, cur: null }; return; }
     const port = e.target.closest('[data-port]');
     if (port) {
       const it = itemById(port.closest('[data-item]').dataset.item), pid = port.dataset.port, pr = portOf(it, pid);
@@ -981,6 +1192,7 @@ export async function openEditor(root, opts) {
       case 'floor': { const f = floorById(drag.id); f.x = snapV(drag.x0 + w.x - drag.p0.x); f.y = snapV(drag.y0 + w.y - drag.p0.y); drag.moved = true; render(); break; }
       case 'wp': { const c = cableById(drag.c); if (c) { c.wps[drag.i] = snapP(w); render(); } break; }
       case 'link': drag.cur = w; render(); break;
+      case 'link2': drag.cur = w; render(); break;
       case 'box': case 'cropbox': drag.cur = w; render(); break;
       case 'draw': drag.cur = snapP(w); drag.preview = makeShape(drawTool, drag.p0, drag.cur, e.shiftKey); render(); break;
       case 'handle': {
@@ -1023,6 +1235,13 @@ export async function openEditor(root, opts) {
       if (port && port.closest('[data-item]')) { const it = port.closest('[data-item]').dataset.item, pid = port.dataset.port; connect(d.from, { item: it, port: pid }); }
       else { const n = nearestPort(toWorld(e), d.from.item); if (n) connect(d.from, n); }
       render(); return;
+    }
+    if (d.kind === 'link2') {
+      const el = document.elementFromPoint(e.clientX, e.clientY), ti = el && el.closest && el.closest('[data-item]');
+      render();
+      if (ti && ti.dataset.item !== d.from) openPortPicker(d.from, ti.dataset.item);
+      else if (d.cur) toast('Lass den Griff auf dem Gerät los, mit dem verbunden werden soll.');
+      return;
     }
     if (d.kind === 'box') {
       const b = normBox(d.p0, d.cur);
@@ -1216,6 +1435,7 @@ export async function openEditor(root, opts) {
     if (k === 'v') setMode('select'); else if (k === 'k') setMode('calib');
     else if (k === 'g') { S.grid = !S.grid; changed(); }
     else if (k === 'l') act('orient');
+    else if (k === 'r' && S.real && sel.ids.size) rotateSel();
     else if (k === 't') { toggleDtb(true); drawTool = 'text'; renderDtb(); render(); }
     else if (k === 'z') { toggleDtb(true); drawTool = 'zone'; renderDtb(); render(); }
     else if (e.key.startsWith('Arrow') && sel.ids.size) {
@@ -1298,7 +1518,7 @@ export async function openEditor(root, opts) {
   }
   async function saveItemAsGear(it) {
     try {
-      const g = await api.post('/api/gear', { name: it.name, category: 'Eigene', color: it.color, ports: it.ports, elements: it.elements, gear_id: it.inv || null });
+      const g = await api.post('/api/gear', { name: it.name, category: 'Eigene', color: it.color, ports: it.ports, elements: it.elements, gear_id: it.inv || null, dim: dimOf(it) });
       pushUndo(); it.gear = g.id; changed(); myGear = null; loadMyGear(); toast(`„${it.name}“ ist jetzt in deinen Geräten.`);
     } catch (e) { toast(e.message, 4000, 'bad'); }
   }
@@ -1358,6 +1578,8 @@ export async function openEditor(root, opts) {
       ${field('iInv', 'Geräte-ID', it.inv, 'text', 'placeholder="Inventar-Nr., optional" maxlength="60"')}
       <label class="row"><span>Farbe</span><input type="color" id="iColor" value="${esc(it.color)}"></label>
       <label class="row"><span>Notiz</span><input class="inp" id="iNotes" value="${esc(it.notes || '')}" placeholder="z. B. auf Stativ, 1,80 m"></label>
+      <div class="row"><span>Maße (cm)</span><span class="inline dims"><input class="inp sm" id="iDw" inputmode="decimal" value="${fmtNum(dimOf(it).w, 0)}" aria-label="Breite in cm" ${readonly ? 'disabled' : ''}>×<input class="inp sm" id="iDd" inputmode="decimal" value="${fmtNum(dimOf(it).d, 0)}" aria-label="Tiefe in cm" ${readonly ? 'disabled' : ''}>×<input class="inp sm" id="iDh" inputmode="decimal" value="${fmtNum(dimOf(it).h || 0, 0)}" aria-label="Höhe in cm" ${readonly ? 'disabled' : ''}></span></div>
+      ${S.real && !readonly ? `<div class="row"><span>Drehung</span><span class="inline"><span class="chip">${it.rot || 0}°</span><button class="btn sm" data-a="rot" title="Um 90° drehen (R)">↻ 90°</button></span></div>` : ''}
       ${readonly ? '' : `<div class="btnrow"><button class="btn" data-a="edit">Ports bearbeiten</button><button class="btn" data-a="dup">Duplizieren</button><button class="btn" data-a="savegear">${it.gear ? 'Als neues Gerät speichern' : 'In meinen Geräten speichern'}</button>${it.gear ? '<button class="btn" data-a="syncgear">Aus Bibliothek aktualisieren</button>' : ''}<button class="btn bad" data-a="del">Löschen</button></div>`}
     </div>
     <div class="sec"><h3>Ports <span class="muted small">${esc(portSummary(it.ports))}</span></h3><div class="portlist">${rows || '<p class="hint">Keine Ports.</p>'}</div></div>`;
@@ -1430,18 +1652,19 @@ export async function openEditor(root, opts) {
     <div class="sec"><h3>Ebenen ${readonly ? '' : '<button class="btn sm pri" data-a="addLevel">+ Ebene</button>'}</h3>
       <div class="lvlist">${lvSorted().map(l => { const fl = S.floors.filter(f => f.lv === l.id); const n = S.items.filter(o => o.lv === l.id).length; return `<div class="lvrow${l.id === curLv ? ' on' : ''}">
         <div class="inline"><input class="inp sm" data-lvn="${l.id}" value="${esc(l.name)}" maxlength="24" aria-label="Name der Ebene" ${readonly ? 'disabled' : ''}>
-          <span class="inline small muted lvh"><input class="inp sm" data-lve="${l.id}" value="${fmtNum(toUser(l.elev), 2).replace(/,00$/, '')}" inputmode="decimal" aria-label="Höhe der Ebene" style="width:64px" ${readonly ? 'disabled' : ''}>${uName()}</span></div>
+          <span class="inline small muted lvh"><input class="inp sm" data-lve="${l.id}" value="${fmtNum(toUser(l.elev), 2).replace(/,00$/, '')}" inputmode="decimal" aria-label="Höhe der Ebene" style="width:64px" ${readonly ? 'disabled' : ''}>${uName()}</span>
+          <span class="inline small muted lvh" title="Maßstab der Zeichnung">1:<input class="inp sm" data-lvs="${l.id}" type="number" min="1" step="1" value="${l.scale || ''}" placeholder="100" aria-label="Maßstab der Ebene" style="width:64px" ${readonly ? 'disabled' : ''}></span></div>
         <div class="small muted">${n} Gerät${n === 1 ? '' : 'e'} · ${fl.length ? `Grundriss: ${esc(fl.map(f => f.name).join(', '))}` : 'kein Grundriss'}</div>
         <div class="btnrow">${l.id === curLv ? '<span class="chip acc">angezeigt</span>' : `<button class="btn sm" data-lvgo="${l.id}">Anzeigen</button>`}${readonly ? '' : `<button class="btn sm${fl.length ? '' : ' pri'}" data-lvfloor="${l.id}">${fl.length ? 'Grundriss ersetzen' : 'Grundriss zuweisen'}</button>${S.levels.length > 1 ? `<button class="btn sm bad" data-lvdel="${l.id}">Löschen</button>` : ''}`}</div>
       </div>`; }).join('')}</div>
-      <p class="hint small">Die Höhe ist die Fußbodenhöhe der Ebene (EG = 0). Kabel zwischen Ebenen bekommen den Höhenunterschied automatisch dazu. Ebenen wechselst du oben über der Planfläche oder mit Bild ↑/↓.</p>
+      <p class="hint small">Die Höhe ist die Fußbodenhöhe der Ebene (EG = 0), „1:“ der Maßstab der Zeichnung (steht im Plankopf, meist 1:100 oder 1:50). Kabel zwischen Ebenen bekommen den Höhenunterschied automatisch dazu. Ebenen wechselst du oben über der Planfläche oder mit Bild ↑/↓.</p>
     </div>
     <div class="sec"><h3>Grundriss – ${esc(lvById(curLv).name)} ${readonly ? '' : '<button class="btn sm" data-a="addFloor">+ Laden</button>'}</h3>
       ${S.floors.filter(onLv).length ? S.floors.filter(onLv).map(f => `<div class="floorrow">
         <div class="fr-head"><input class="inp sm" data-fname="${f.id}" value="${esc(f.name)}" aria-label="Name des Grundrisses"> ${f.calibrated ? '<span class="chip ok">kalibriert</span>' : '<span class="chip warn">nicht kalibriert</span>'}</div>
-        <div class="small muted">${fmtNum(toUser(f.w / U), 1)} × ${fmtLen(f.h / U, 1)}${f.page ? ` · PDF-Seite ${f.page}` : ''}${f.transparent ? ' · nur Zeichnung' : ''}${f.crop ? ' · zugeschnitten' : ''}</div>
-        ${readonly ? '' : `<div class="btnrow"><button class="btn sm pri" data-fa="calib" data-f="${f.id}">Maßstab</button><button class="btn sm" data-fa="lock" data-f="${f.id}">${f.locked === false ? 'Fixieren' : 'Verschieben'}</button><button class="btn sm" data-fa="crop" data-f="${f.id}">Zuschneiden</button>${f.crop ? `<button class="btn sm" data-fa="uncrop" data-f="${f.id}">Zuschnitt aufheben</button>` : ''}${f.transparent ? '' : `<button class="btn sm" data-fa="clear" data-f="${f.id}">Weiß entfernen</button>`}${f.src ? `<button class="btn sm" data-fa="page" data-f="${f.id}">Andere Seite</button>` : ''}<button class="btn sm" data-fa="zoom" data-f="${f.id}">Zeigen</button><button class="btn sm bad" data-fa="del" data-f="${f.id}">Entfernen</button></div>
-        ${f.pdf ? `<label class="row"><span>PDF-Maßstab 1:</span><span class="inline"><input class="inp sm" data-pdfscale="${f.id}" type="number" min="1" placeholder="${f.pdfScale || 100}"><button class="btn sm" data-fa="pdf" data-f="${f.id}">Anwenden</button></span></label>` : ''}
+        <div class="small muted">${fmtNum(toUser(f.w / U), 1)} × ${fmtLen(f.h / U, 1)}${f.page ? ` · PDF-Seite ${f.page}` : ''}${f.vector ? ' · nur Wände und Fenster' : f.transparent ? ' · nur Zeichnung' : ''}${f.crop ? ' · zugeschnitten' : ''}</div>
+        ${readonly ? '' : `<div class="btnrow"><button class="btn sm pri" data-fa="calib" data-f="${f.id}">Maßstab</button><button class="btn sm" data-fa="lock" data-f="${f.id}">${f.locked === false ? 'Fixieren' : 'Verschieben'}</button><button class="btn sm" data-fa="crop" data-f="${f.id}">Zuschneiden</button>${f.crop ? `<button class="btn sm" data-fa="uncrop" data-f="${f.id}">Zuschnitt aufheben</button>` : ''}${f.transparent || f.vector ? '' : `<button class="btn sm" data-fa="clear" data-f="${f.id}">Weiß entfernen</button>`}${f.src ? `<button class="btn sm" data-fa="page" data-f="${f.id}">Andere Seite</button>` : ''}<button class="btn sm" data-fa="zoom" data-f="${f.id}">Zeigen</button><button class="btn sm bad" data-fa="del" data-f="${f.id}">Entfernen</button></div>
+        ${f.pdf ? `<label class="row"><span>Maßstab 1:</span><span class="inline"><input class="inp sm" data-pdfscale="${f.id}" type="number" min="1" value="${lvById(f.lv).scale || f.pdfScale || ''}" placeholder="100"><button class="btn sm" data-fa="pdf" data-f="${f.id}">Anwenden</button></span></label>` : ''}
         <label class="row"><span>Deckkraft</span><input type="range" data-fop="${f.id}" min="0.1" max="1" step="0.05" value="${f.opacity ?? 0.9}"></label>
         <div class="chkrow"><label class="chk"><input type="checkbox" data-fvis="${f.id}"${f.visible !== false ? ' checked' : ''}> Anzeigen</label><label class="chk"><input type="checkbox" data-finv="${f.id}"${f.invert ? ' checked' : ''}> Im Dark Mode invertieren</label></div>`}
       </div>`).join('') : `<p class="hint">Diese Ebene hat noch keinen Grundriss. Weise ein PDF (auch eine bestimmte Seite) oder ein Bild zu. Danach den Maßstab setzen – oder er wird von einem kalibrierten PDF einer anderen Ebene übernommen.</p>${readonly ? '' : '<button class="btn pri" data-a="addFloor">Grundriss zuweisen</button>'}`}
@@ -1456,7 +1679,8 @@ export async function openEditor(root, opts) {
     </div>
     <div class="sec"><h3>Darstellung</h3>
       <div class="row"><span>Ausrichtung</span><div class="seg"><button data-orient="tb" class="${S.orient === 'tb' ? 'on' : ''}">Oben → Unten</button><button data-orient="ltr" class="${S.orient === 'ltr' ? 'on' : ''}">Links → Rechts</button></div></div>
-      <label class="row"><span>Gerätegröße</span><input type="range" id="pDs" min="0.25" max="1.5" step="0.05" value="${S.ds}"></label>
+      <div class="row"><span>Geräte</span><div class="seg"><button data-a="real" class="${S.real ? '' : 'on'}" ${S.real ? '' : 'disabled'}>Symbol mit Ports</button><button data-a="real" class="${S.real ? 'on' : ''}" ${S.real ? 'disabled' : ''}>Echte Größe</button></div></div>
+      ${S.real ? '<p class="hint small">Geräte werden mit ihren Maßen (Auswahl → Maße) im Maßstab des Grundrisses gezeigt. Verbinden: Gerät anklicken, am ＋-Griff auf das Ziel ziehen. Drehen mit R.</p>' : `<label class="row"><span>Gerätegröße</span><input type="range" id="pDs" min="0.25" max="1.5" step="0.05" value="${S.ds}"></label>`}
       <label class="chk"><input type="checkbox" id="pLbl"${S.labels ? ' checked' : ''} data-ro="1"> Kabel-IDs und Längen am Kabel</label>
       <label class="chk"><input type="checkbox" id="pLeg"${S.legend ? ' checked' : ''} data-ro="1"> Kabel-Legende</label>
       <label class="chk"><input type="checkbox" id="pHops"${S.hops ? ' checked' : ''}> Sprünge an Kabelkreuzungen</label>
@@ -1528,7 +1752,8 @@ export async function openEditor(root, opts) {
     if (readonly) return;
     const t = e.target, id = t.id, one = [...sel.ids][0], it = itemById(one), s = shapeById(one), c = cableById(sel.cable);
     const set = (o, k, v) => { editStart(); o[k] = v; render(); markDirty(); };
-    if (it) { if (id === 'iLabel') set(it, 'label', t.value); if (id === 'iName') set(it, 'name', t.value); if (id === 'iInv') set(it, 'inv', t.value); if (id === 'iNotes') set(it, 'notes', t.value); if (id === 'iColor') set(it, 'color', t.value); }
+    if (it) { if (id === 'iLabel') set(it, 'label', t.value); if (id === 'iName') set(it, 'name', t.value); if (id === 'iInv') set(it, 'inv', t.value); if (id === 'iNotes') set(it, 'notes', t.value); if (id === 'iColor') set(it, 'color', t.value);
+      if (['iDw', 'iDd', 'iDh'].includes(id)) { const v = num(t.value); if (v > 0) { const c = center(it); const d = { ...dimOf(it) }; d[{ iDw: 'w', iDd: 'd', iDh: 'h' }[id]] = Math.min(5000, v); editStart(); it.dim = d; if (S.real) { const b = itemBox(it); it.x = c.x - b.w / 2; it.y = c.y - b.h / 2; routeCache.clear(); } render(); markDirty(); } } }
     if (s) { if (id === 'shLabel') set(s, 'label', t.value); if (id === 'shText') set(s, 'text', t.value); if (id === 'shSize') set(s, 'size', +t.value); if (id === 'shRot') { set(s, 'rot', +t.value); t.nextElementSibling.textContent = t.value + '°'; } }
     if (c) { if (id === 'cLabel') set(c, 'label', t.value.trim()); if (id === 'cNotes') set(c, 'notes', t.value); if (id === 'cOverride') set(c, 'override', t.value.trim() ? fromUser(num(t.value)) : null); if (id === 'cExtra') set(c, 'extra', t.value.trim() ? fromUser(num(t.value)) : 0); }
     if (id === 'mJob') setMeta('job_id', t.value); if (id === 'mVenue') setMeta('venue', t.value);
@@ -1541,6 +1766,7 @@ export async function openEditor(root, opts) {
     if (id === 'sSlack') set(st, 'endSlack', Math.max(0, fromUser(num(t.value)))); if (id === 'sHeight') set(st, 'heightAdd', Math.max(0, fromUser(num(t.value)))); if (id === 'sRes') set(st, 'reserve', clamp(num(t.value), 0, 200));
   });
   on(pane, 'change', (e) => {
+    if (e.target.dataset && e.target.dataset.lvs && !readonly) { const N = num(e.target.value); if (N > 0 && N !== lvById(e.target.dataset.lvs).scale) setLevelScale(e.target.dataset.lvs, N); return; }
     const t = e.target, id = t.id, c = cableById(sel.cable), s = shapeById([...sel.ids][0]);
     if (id === 'pLbl') { S.labels = t.checked; render(); if (!readonly) markDirty(); return; }
     if (id === 'pLeg') { S.legend = t.checked; render(); if (!readonly) markDirty(); return; }
@@ -1609,8 +1835,21 @@ export async function openEditor(root, opts) {
     if (a === 'clear') clearFloorBg(id);
     if (a === 'page') openFloorDialog({ lv: f.lv, srcPdf: f.src, replaceFloor: f.id });
   }
+  function setLevelScale(lvId, N) {
+    const l = lvById(lvId); if (!(N > 0)) { toast('Gib den Maßstab ein, z. B. 100 für 1:100.'); return; }
+    pushUndo(); l.scale = N;
+    let n = 0;
+    S.floors.filter(f => f.lv === lvId && f.pdf).forEach(f => {
+      const o = pageOrigin(f), c = cropOf(f), k = worldPerPx(f, N);
+      f.w = c.w * k; f.h = c.h * k; f.x = o.x + (c.x + (f.pdf.ox || 0)) * k; f.y = o.y + (c.y + (f.pdf.oy || 0)) * k; f.calibrated = true; f.pdfScale = N; n++;
+    });
+    const auto = n ? enableRealOnce() : false;
+    routeCache.clear(); changed();
+    toast(n ? `Maßstab 1:${N} für „${l.name}“ übernommen. Alle Kabellängen sind aktualisiert.${auto ? ' Geräte werden jetzt maßstäblich gezeigt.' : ''}` : `Maßstab 1:${N} gespeichert – er gilt für den nächsten PDF/SVG-Grundriss dieser Ebene. Bild-Grundrisse kalibrierst du mit „Maßstab“ (zwei Punkte).`, 5500);
+  }
   function applyPdfScale(id) {
     const f = floorById(id); const N = num(pane.querySelector(`[data-pdfscale="${id}"]`)?.value);
+    if (f && f.pdf) { setLevelScale(f.lv, N); return; }
     const a = assets.get(f.asset);
     if (!(N > 0) || !f.pdf || !a) { toast('Gib den Zeichnungsmaßstab ein, z. B. 100 für 1:100.'); return; }
     const mPerPx = f.pdf.ptPerPx * 0.000352778 * N;
@@ -1628,6 +1867,7 @@ export async function openEditor(root, opts) {
       case 'redo': doRedo(); break;
       case 'draw': toggleDtb(); break;
       case 'grid': S.grid = !S.grid; changed(); break;
+      case 'real': setReal(!S.real); break;
       case 'orient': pushUndo(); S.orient = S.orient === 'tb' ? 'ltr' : 'tb'; clearLayoutCache(); routeCache.clear(); changed(); break;
       case 'fit': fit(); break;
       case 'zoomin': setZoom(view.z * 1.25); break;
@@ -1638,6 +1878,7 @@ export async function openEditor(root, opts) {
       case 'newgear': navigate('/gear/new?back=' + encodeURIComponent(location.pathname)); break;
       case 'del': deleteSelection(); break;
       case 'dup': duplicateSelection(); break;
+      case 'rot': rotateSel(); break;
       case 'edit': editItemPorts(one); break;
       case 'savegear': saveItemAsGear(itemById(one)); break;
       case 'syncgear': syncItemFromGear(itemById(one)); break;
@@ -1806,7 +2047,7 @@ export async function openEditor(root, opts) {
       U, cur: curLv, dark: document.documentElement.dataset.theme === 'dark' || (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches),
       levels: S.levels.map(l => ({ id: l.id, name: l.name, elev: l.elev })),
       floors: S.floors.filter(f => f.visible !== false && assets.get(f.asset)).map(f => { const a = assets.get(f.asset); return { lv: f.lv, url: assetUrl(f.asset), x: f.x, y: f.y, w: f.w, h: f.h, crop: cropOf(f), aw: a.w, ah: a.h, opacity: f.opacity ?? 0.9 }; }),
-      items: S.items.map(it => { const b = itemBox(it); return { id: it.id, lv: it.lv, x: b.x, y: b.y, w: b.w, h: b.h, color: it.color, name: itemName(it) }; }),
+      items: S.items.map(it => { const b = itemBox(it), d = dimOf(it), r = it.rot === 90 || it.rot === 270; return { id: it.id, lv: it.lv, x: b.x, y: b.y, w: b.w, h: b.h, color: it.color, name: itemName(it), real: { w: (r ? d.d : d.w) / 100, d: (r ? d.w : d.d) / 100, h: (d.h || 30) / 100 } }; }),
       cables: S.cables.map(c => { const pts = cablePts(c), a = itemById(c.from.item), b = itemById(c.to.item); return pts && a && b ? { pts, from: a.id, to: b.id, lvA: a.lv, lvB: b.lv, color: typeOf(c.type).color, radio: !!typeOf(c.type).nocable } : null; }).filter(Boolean),
       zones: S.shapes.filter(s => s.kind === 'zone').map(z => ({ lv: z.lv, x: z.x, y: z.y, w: z.w, h: z.h, color: COLORS[z.color] || z.color || COLORS.blue, label: z.label || '' })),
       title: meta.name || 'Plan',

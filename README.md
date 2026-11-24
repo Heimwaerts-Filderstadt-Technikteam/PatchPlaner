@@ -21,13 +21,14 @@ Läuft ohne Docker und ohne npm-Pakete: nur Node.js 22.13 oder neuer (SQLite ist
 
 **Ebenen (UG, EG, Empore …)**
 - Ebenen selbst anlegen, benennen (Doppelklick auf den Reiter über der Planfläche) und mit Fußbodenhöhe versehen; Wechsel per Reiter oder Bild ↑/↓
-- Jede Ebene bekommt ihren eigenen Grundriss: PDF (beliebige Seite) oder Bild. Ein mehrseitiges PDF wird einmal hochgeladen, weitere Seiten weist du anderen Ebenen direkt zu
-- „Nur die Zeichnung übernehmen“: weißes Papier wird durchsichtig, Linien und Beschriftungen bleiben (auch farbige) – die Ebenen liegen sauber übereinander
-- Zuschneiden, um Plankopf und Legende loszuwerden
-- Ist ein PDF-Grundriss kalibriert, übernehmen die anderen Seiten Maßstab und Lage automatisch
+- Jede Ebene bekommt ihren eigenen Grundriss: PDF (beliebige Seite), SVG oder Bild. Ein mehrseitiges PDF wird einmal hochgeladen, weitere Seiten weist du anderen Ebenen direkt zu
+- **Nur Wände und Fenster übernehmen** (PDF aus dem CAD und SVG): Text, Bemaßung, Möbel, Türen, Treppen, Legende, Plankopf und Blattrahmen fliegen raus. Wände werden an Füllung bzw. Strichstärke erkannt, Fenster daran, dass sie zwischen zwei Wandstücken liegen. Vorschau mit Korrektur je Linienart (Wand / Prüfen / Weg); SVGs mit Layern („Wände“, „Fenster“ …) werden nach Layern gefiltert. Ergebnis ist ein scharfer Vektor-Grundriss
+- Alternativ ganze Zeichnung ohne weißen Hintergrund oder ganze Seite als Bild; Zuschneiden, um Reste loszuwerden
+- **Maßstab je Ebene** (1:100, 1:50 …): Größe des Grundrisses ergibt sich direkt daraus; Seiten aus demselben Plansatz liegen nach Blattkoordinaten deckungsgleich übereinander
+- **Geräte in echter Größe** („Maßstäblich“): Grundfläche aus den Maßen (B × T × H, im Geräte-Bauer und je Gerät einstellbar, sinnvolle Vorgaben nach Gerätename), drehen mit R, Verbinden über den ＋-Griff mit Port-Auswahl; schaltet beim ersten maßstäblichen Grundriss automatisch ein
 - Andere Ebenen blass einblenden zum Ausrichten; Kabel zwischen Ebenen bekommen den Höhenunterschied automatisch zur Länge dazu (Steigleitung als ↕-Punkt)
 - Packliste nach Ebenen gruppiert, Patchliste mit Spalte „Ort“, PDF-Export mit einer Planseite je Ebene
-- 3D-Ansicht: alle Ebenen übereinander mit Grundrissen, Geräten, Kabeln und Steigleitungen; drehen, zoomen, Ebenen ein-/ausblenden, Abstand regeln, als PNG speichern
+- 3D-Ansicht: alle Ebenen übereinander mit Grundrissen, Geräten (in echter Größe), Kabeln und Steigleitungen; drehen, zoomen, Ebenen ein-/ausblenden, Abstand regeln, als PNG speichern
 
 **Grundrisse und Kabellängen**
 - Beliebig viele Grundrisse pro Plan (PNG, JPG, WebP, GIF, SVG oder PDF)
@@ -65,7 +66,7 @@ sudo nano /opt/patchplaner/.env      # BASE_URL, ggf. SMTP
 sudo systemctl restart patchplaner
 ```
 
-Das Skript installiert bei Bedarf Node.js 22 und poppler-utils (für PDF-Grundrisse), legt den Benutzer `patchplaner` an, kopiert alles nach `/opt/patchplaner` und richtet den systemd-Dienst ein. Updates: `sudo bash /opt/patchplaner/deploy/update.sh` (holt den neuen Stand per Git und startet neu) – oder neue Version entpacken und das Skript erneut ausführen. Daten und `.env` bleiben erhalten.
+Das Skript installiert bei Bedarf Node.js 22 und poppler-utils (für PDF-Grundrisse; `pdftocairo` daraus für „Nur Wände und Fenster“), legt den Benutzer `patchplaner` an, kopiert alles nach `/opt/patchplaner` und richtet den systemd-Dienst ein. Updates: `sudo bash /opt/patchplaner/deploy/update.sh` (holt den neuen Stand per Git und startet neu) – oder neue Version entpacken und das Skript erneut ausführen. Daten und `.env` bleiben erhalten.
 
 Danach `http://SERVER:8080` öffnen. Das erste Konto wird Admin.
 
